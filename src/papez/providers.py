@@ -12,9 +12,19 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from papez.engine import config
 from papez.mcp.tools import MCPToolHandler
-from papez.storage.base import CacheProvider, EmbeddingProvider, EventBusProvider, GraphStorageProvider
+from papez.storage.audit import InMemoryAuditSink
+from papez.storage.base import (
+    AuditSink,
+    CacheProvider,
+    EmbeddingProvider,
+    EventBusProvider,
+    GraphStorageProvider,
+    SpaceRegistry,
+)
 from papez.storage.memory import InMemoryCacheProvider, InMemoryEventBusProvider, InMemoryGraphProvider
+from papez.storage.spaces import InMemorySpaceRegistry
 
 load_dotenv()
 
@@ -28,6 +38,18 @@ class Providers:
     event_bus: EventBusProvider | None
     tools: MCPToolHandler
     user_id: str
+    spaces: SpaceRegistry
+    audit: AuditSink
+
+
+def registry_path_for(graph_persist_path: str | Path | None) -> Path | None:
+    """Sidecar registry path next to the graph file (D05): ``memories.json`` -> ``memories.spaces.json``.
+
+    ``None`` when the graph is not persisted.
+    """
+    if not graph_persist_path:
+        return None
+    return Path(graph_persist_path).with_suffix(".spaces.json")
 
 
 _instance: Providers | None = None
@@ -79,8 +101,13 @@ def get_providers() -> Providers:
     user_id = os.getenv("GENESYS_USER_ID", "default_user")
 
     default_persist = str(Path(__file__).parent.parent.parent / "data" / "memories.json")
-    graph = InMemoryGraphProvider(persist_path=os.getenv("GENESYS_PERSIST_PATH", default_persist))
+    persist_path = os.getenv("GENESYS_PERSIST_PATH", default_persist)
+    graph = InMemoryGraphProvider(persist_path=persist_path)
     cache = InMemoryCacheProvider()
+    # No I/O here (papez.server builds providers at import time); the
+    # registry file is read in spaces.initialize().
+    spaces = InMemorySpaceRegistry(persist_path=registry_path_for(persist_path or None))
+    audit = InMemoryAuditSink(max_events=config.AUDIT_MAX_EVENTS)
     embeddings = _make_embedder()
 
     llm_provider = None
@@ -107,6 +134,7 @@ def get_providers() -> Providers:
         cache=cache,
         event_bus=event_bus,
         llm=llm_provider,
+        # TODO(WS-L5): pass spaces=spaces, audit=audit once MCPToolHandler accepts them.
     )
 
     _instance = Providers(
@@ -117,5 +145,7 @@ def get_providers() -> Providers:
         event_bus=event_bus,
         tools=tools,
         user_id=user_id,
+        spaces=spaces,
+        audit=audit,
     )
     return _instance

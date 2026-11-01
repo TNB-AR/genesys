@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0 (unreleased)
+## 0.8.0
 
 What the embeddable space view needs from the library. Additive: every new parameter is appended with a default. The tool count stays at 26.
 

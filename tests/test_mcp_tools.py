@@ -507,7 +507,9 @@ class TestConciseRecallF7:
         h = await _real_handler()
         await h.memory_store("concise recall subject matter")
         rec = await h.memory_recall("subject matter", verbosity="concise")
-        allowed = {"id", "summary", "status", "score", "activation", "is_core", "superseded_by"}
+        # Mind Spaces (D09): concise hits also carry tags, ref_count and space.
+        allowed = {"id", "summary", "status", "score", "activation", "is_core", "superseded_by",
+                   "tags", "ref_count", "space"}
         for hit in rec["results"]:
             assert set(hit.keys()) <= allowed
             assert "content" not in hit and "causal_basis" not in hit

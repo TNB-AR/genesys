@@ -141,7 +141,7 @@ than treat a memory call as fatal**:
 |------|-------------|
 | `memory_store` | Store a new memory. Use `related` for writer-specified **typed** edges (`{id, type}`); `related_to` is legacy and always creates `caused_by`. Optional `category`, `refs`, `tags`, `space`, `external_id`, `on_existing` (`amend` default, `skip`, `error`). May return `possible_conflicts` (heuristic hints). |
 | `memory_amend` | Record a correction: creates a new memory that **supersedes** an existing one. The old memory is kept (decayed in recall), not deleted. Optional `refs` / `tags` (omitted: copied from the old memory; given: replace). Stays in the old memory's space. |
-| `memory_recall` | Recall memories by natural language query (vector + keyword + graph spreading activation). Supports `verbosity: "concise"` for lightweight payloads. Optional `tags_any`, `ref_type`, `space`, `spaces`, `include_personal`. |
+| `memory_recall` | Recall memories by natural language query (vector + keyword + graph spreading activation). Supports `verbosity: "concise"` or `"light"` for lightweight payloads. Optional `tags_any`, `ref_type`, `space`, `spaces`, `include_personal`, `category`, `exclude_superseded`. |
 | `memory_search` | Filtered vector search by status, category, date (`since`), last-active date (`active_since`), entity, and now `tags_any`, `tags_all`, `ref_type`, `ref_id`. Pass an **empty query** to enumerate by recency instead (no embedder needed) — with `since`/`active_since` this answers "what's new since I last looked" without knowing what to query for. Optional `space`, `spaces`, `include_personal`. |
 | `memory_traverse` | Walk the causal graph from a node. Returns reachable **nodes and the edges** of the induced subgraph (`source/target/type/weight/created_by`) — a superset of the BFS tree, so paths can be reconstructed. Honors `edge_types`. Optional `space`, `spaces`, `include_personal`. An invisible start node returns `not_found`. |
 | `memory_explain` | Explain a memory's score. Includes a `score_model` block (formula + live per-force breakdown + staleness note), `removal_impact`, and the memory's `refs`, `tags`, `space`. |
@@ -154,10 +154,10 @@ than treat a memory call as fatal**:
 | `promote_to_org` | Promote a private memory to org visibility (not for space memories) |
 | `memory_store_batch` | Store up to 100 memories into one space in one call. Validates every item first (all or nothing), supports `ref_index` links to earlier items, returns one result per item. Safe to retry when every item has an `external_id`. |
 | `memory_retire_by_ref` | Retire the memories citing a removed source (`ref_type`, `ref_id`). `mode="amend"` (default) or `"delete"`. Optional `space`. |
-| `space_create` | Create a Mind Space; you become its owner. `name`, optional `slug`, `org_id`, `description`, `forgetting_policy`, `llm_inference_enabled`. |
+| `space_create` | Create a Mind Space; you become its owner. `name`, optional `slug`, `org_id`, `description`, `forgetting_policy`, `llm_inference_enabled`, `show_service_names`. |
 | `space_list` | List your spaces with your role and counts. Optional `include_archived`. |
 | `space_get` | One space, with member and memory counts (reader+) |
-| `space_update` | Change name, description, `forgetting_policy`, `llm_inference_enabled` (owner) |
+| `space_update` | Change name, description, `forgetting_policy`, `llm_inference_enabled`, `show_service_names` (owner) |
 | `space_member_add` | Add a user or service with a role, or change an existing member's role (owner) |
 | `space_member_remove` | Remove a member (owner; the last user owner can't be removed) |
 | `space_member_list` | List members (reader+) |
@@ -238,8 +238,14 @@ sources just lose the ref.
 `memory_recall(query, verbosity="concise")` skips the causal-chain enrichment and
 returns only `id / summary / status / score / activation / is_core` (plus
 `superseded_by` when set) per hit — much cheaper on tokens for high-frequency
-lookups. `verbosity="full"` (the default) is unchanged. Reactivation writes still
-occur in both modes (they are governed by `read_only`, not `verbosity`).
+lookups. `verbosity="light"` also skips the causal chains but keeps the rest of the
+full hit (content, refs, category). `verbosity="full"` (the default) is unchanged.
+Reactivation writes still occur in every mode (they are governed by `read_only`,
+not `verbosity`).
+
+`category="note"` and `exclude_superseded=true` narrow a recall, and `k` matching
+results still come back when enough of them exist among the `min(k*4, 400)`
+best candidates.
 
 See [`docs/scoring.md`](docs/scoring.md) for what `activation` / `decay_score`
 actually mean — in short, it is a retention weight that **rises** when a memory is
@@ -275,6 +281,12 @@ and an unknown space looks exactly like one you aren't a member of
 - **Policies.** `forgetting_policy="retain_all"` (default) means nothing in the
   space is ever pruned; `"standard"` applies the normal forgetting rules inside the
   space. `llm_inference_enabled=false` stops every LLM call on the space's content.
+  `show_service_names=false` keeps the writing credential's name off embed author
+  lines.
+- **Attribution.** `on_behalf_of` records the person a memory was written for
+  (`{id, email, name, via}`), while `created_by` stays the credential that wrote
+  it. Trusted host code sets it through the Python handler; it is deliberately not
+  an MCP argument. Recall, search and `memory_explain` show both.
 - **Audit.** Every action touching a space emits an event (ids, counts and
   lengths only, never content) to the configured `AuditSink`.
 - **Locally**, the stdio server is one user (`stdio_local_user`) in one org

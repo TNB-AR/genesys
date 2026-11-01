@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.0 (unreleased)
+
+What the embeddable space view needs from the library. Additive: every new parameter is appended with a default. The tool count stays at 26.
+
+### New parameters
+
+- `memory_recall`: `category`, `exclude_superseded=False`, and `verbosity="light"` (full hits without the causal-chain queries). The two filters run in the tool layer after decryption, over-fetching `min(k*4, 400)` candidates, and also apply to the core injection list and the result floor backfill.
+- `space_create`: `show_service_names=True`. `space_update`: `show_service_names=None`. The setting says whether embed author lines may name the writing credential.
+- Handler only, deliberately not MCP arguments, so an MCP caller can't forge attribution: `on_behalf_of=None` on `memory_store`, `memory_store_batch`, `memory_amend`, `memory_retire_by_ref`.
+
+### New library surface
+
+- `MemoryNode.on_behalf_of` (`{"id", "email", "name", "via"}`), and `validate_viewer` in `papez.models.attribution` (raises `ValidationFailure("invalid_viewer", ...)`). A superseding node does not inherit the value, and it doesn't count towards "identical" for `on_existing`.
+- `Space.show_service_names`, default true; old sidecar files load unchanged.
+- `current_embed` context variable. While it is bound, storage and the tool layer stay on that one space whatever the arguments say, every write is stamped with the token's viewer, and whole-user, whole-space and space-management operations answer `embed_not_allowed` (`PermissionError` in storage).
+- `GraphStorageProvider`: `list_space_nodes(space_id, *, limit=20, before=None, tags_any=None, include_superseded=False)` and `space_tag_counts(space_id, limit=12)`.
+- `MCPToolHandler` methods, not MCP tools: `space_memories`, `memory_detail`, `space_tags`, and `audit_event` (public name for `_audit_event`).
+
+### Output
+
+- Full and light recall hits, search hits and `memory_explain` add `on_behalf_of` and `created_by` (the writing principal, `original_user_id`). Recall hits add `category`. Concise recall hits are unchanged.
+- Space objects add `show_service_names`.
+- Audit: new actions `memory.list` and `space.tags`. `memory_detail` emits `memory.explain`. Events caused by an embed token add `on_behalf_of` and `embed_token_id` to `detail`.
+
+### Tests
+
+- `tests/test_space_tools.py` and `tests/test_space_isolation_storage.py` were changed on purpose: the space key set gains `show_service_names`, and the read-path table gains the two new storage reads.
+
 ## 0.7.0
 
 Mind Spaces, references and tags, idempotent writes and an audit log. Additive: every new parameter is appended with a default, so existing calls and the `MCPToolHandler(...)` keyword construction keep working. The tool count goes from 13 to 26. Full reference: [`docs/mind-spaces.md`](docs/mind-spaces.md); integration guide: [`docs/integration.md`](docs/integration.md).

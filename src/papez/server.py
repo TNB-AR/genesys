@@ -85,7 +85,7 @@ app = _build_server()
 _TOOL_DISPATCH: dict[str, tuple[Any, ...]] = {
     "memory_store": (tools.memory_store, ["content"], {"source_session": "", "related_to": None, "related": None, "category": None, "visibility": "private", "org_id": None, "refs": None, "tags": None, "space": None, "external_id": None, "on_existing": "amend"}),
     "memory_amend": (tools.memory_amend, ["node_id", "content"], {"reason": None, "refs": None, "tags": None}),
-    "memory_recall": (tools.memory_recall, ["query"], {"k": 10, "max_results": None, "verbosity": "full", "tags_any": None, "ref_type": None, "space": None, "spaces": None, "include_personal": None}),
+    "memory_recall": (tools.memory_recall, ["query"], {"k": 10, "max_results": None, "verbosity": "full", "tags_any": None, "ref_type": None, "space": None, "spaces": None, "include_personal": None, "category": None, "exclude_superseded": False}),
     "memory_search": (tools.memory_search, ["query"], {"filters": None, "k": 10, "space": None, "spaces": None, "include_personal": None}),
     "memory_traverse": (tools.memory_traverse, ["node_id"], {"depth": 2, "edge_types": None, "space": None, "spaces": None, "include_personal": None}),
     "memory_explain": (tools.memory_explain, ["node_id"], {}),
@@ -97,10 +97,10 @@ _TOOL_DISPATCH: dict[str, tuple[Any, ...]] = {
     "set_core_preferences": (tools.set_core_preferences, [], {"auto": None, "approval": None, "excluded": None}),
     "promote_to_org": (tools.promote_to_org, ["node_id", "org_id"], {"action": "keep_private", "dry_run": False}),
     # Mind Spaces (spec 6.8)
-    "space_create": (tools.space_create, ["name"], {"slug": None, "org_id": None, "description": None, "forgetting_policy": "retain_all", "llm_inference_enabled": True}),
+    "space_create": (tools.space_create, ["name"], {"slug": None, "org_id": None, "description": None, "forgetting_policy": "retain_all", "llm_inference_enabled": True, "show_service_names": True}),
     "space_list": (tools.space_list, [], {"include_archived": False}),
     "space_get": (tools.space_get, ["space"], {}),
-    "space_update": (tools.space_update, ["space"], {"name": None, "description": None, "forgetting_policy": None, "llm_inference_enabled": None}),
+    "space_update": (tools.space_update, ["space"], {"name": None, "description": None, "forgetting_policy": None, "llm_inference_enabled": None, "show_service_names": None}),
     "space_member_add": (tools.space_member_add, ["space", "principal_id", "principal_type", "role"], {}),
     "space_member_remove": (tools.space_member_remove, ["space", "principal_id"], {}),
     "space_member_list": (tools.space_member_list, ["space"], {}),
@@ -179,12 +179,14 @@ _TOOL_DEFS: list[dict[str, Any]] = [
             "query": {"type": "string"},
             "k": {"type": "integer", "default": 10},
             "max_results": {"type": "integer"},
-            "verbosity": {"type": "string", "enum": ["concise", "full"], "default": "full", "description": "concise = id/summary/status/score/activation/is_core/tags/ref_count/space only, no causal chains."},
+            "verbosity": {"type": "string", "enum": ["concise", "light", "full"], "default": "full", "description": "concise = id/summary/status/score/activation/is_core/tags/ref_count/space only, no causal chains. light = full hits without the causal chains."},
             "tags_any": {"type": "array", "items": {"type": "string"}, "description": "Only memories with at least one of these tags (applied before ranking)."},
             "ref_type": {"type": "string", "description": "Only memories with a ref of this type."},
             "space": _SPACE_READ_SCHEMA,
             "spaces": _SPACES_READ_SCHEMA,
             "include_personal": _INCLUDE_PERSONAL_SCHEMA,
+            "category": {"type": "string", "description": "Only memories in this category."},
+            "exclude_superseded": {"type": "boolean", "default": False, "description": "Leave out memories a newer one has superseded."},
         },
     }},
     {"name": "memory_search", "description": "Filtered vector search by status, category, date, or entity. Pass an EMPTY query to enumerate by recency instead (no vector search, no embedder needed): with since/active_since this answers 'what's new/changed since <ts>' without knowing what to query for.", "inputSchema": {
@@ -259,6 +261,7 @@ _TOOL_DEFS: list[dict[str, Any]] = [
             "description": {"type": "string"},
             "forgetting_policy": {"type": "string", "enum": ["retain_all", "standard"], "default": "retain_all"},
             "llm_inference_enabled": {"type": "boolean", "default": True, "description": "If false, no memory content from this space is sent to an LLM."},
+            "show_service_names": {"type": "boolean", "default": True, "description": "If false, embed author lines don't name the writing credential."},
         },
     }},
     {"name": "space_list", "description": "List the spaces you are a member of, with your role and counts.", "inputSchema": {
@@ -277,6 +280,7 @@ _TOOL_DEFS: list[dict[str, Any]] = [
             "description": {"type": "string"},
             "forgetting_policy": {"type": "string", "enum": ["retain_all", "standard"]},
             "llm_inference_enabled": {"type": "boolean"},
+            "show_service_names": {"type": "boolean"},
         },
     }},
     {"name": "space_member_add", "description": "Add a member to a space, or change an existing member's role (owner).", "inputSchema": {

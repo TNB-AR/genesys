@@ -13,7 +13,7 @@ from papez.storage.memory import InMemoryCacheProvider, InMemoryGraphProvider
 from papez.storage.spaces import InMemorySpaceRegistry
 
 SPACE_KEYS = {"id", "slug", "name", "org_id", "description", "forgetting_policy", "llm_inference_enabled",
-              "archived", "archived_at", "created_at", "created_by"}
+              "show_service_names", "archived", "archived_at", "created_at", "created_by"}
 
 
 async def _world_with_roles() -> SpaceWorld:

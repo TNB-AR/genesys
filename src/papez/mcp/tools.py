@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import inspect
 import logging
 import re
@@ -12,6 +14,7 @@ from typing import Any
 
 from papez.context import (
     current_client,
+    current_embed,
     current_include_personal,
     current_org_ids,
     current_principal_type,
@@ -22,6 +25,7 @@ from papez.context import (
 )
 from papez.core_memory.preferences import CoreMemoryPreferences
 from papez.core_memory.promoter import evaluate_core_promotion
+from papez.models.attribution import validate_viewer
 from papez.models.edge import MemoryEdge
 from papez.models.enums import (
     SPACE_ROLE_RANK,
@@ -192,6 +196,48 @@ def _matches_tags_and_ref_type(node: MemoryNode, tags_any: list[str] | None, ref
     return not ref_type or any(r.type == ref_type for r in node.refs)
 
 
+def _check_on_behalf_of(value: Any) -> dict[str, Any] | None:
+    """Validate a handler caller's ``on_behalf_of``; raises ``ValidationFailure``.
+
+    With an embed token bound the argument is ignored: ``_write_memory_scoped``
+    stamps the token's viewer whatever was passed.
+    """
+    if current_embed.get() is not None or value is None:
+        return None
+    viewer = validate_viewer(value)
+    via = value.get("via", "api")
+    if via not in ("embed", "api"):
+        raise ValidationFailure("invalid_viewer", "on_behalf_of.via must be 'embed' or 'api'")
+    return {**viewer, "via": via}
+
+
+def _embed_refusal() -> dict[str, Any] | None:
+    """The error for an operation an embed token can never reach, or None without one."""
+    if current_embed.get() is None:
+        return None
+    return _error("embed_not_allowed", "This action isn't available with an embed token")
+
+
+def _encode_cursor(node: MemoryNode) -> str:
+    """base64url of ``"<created_at iso>|<id>"``, without padding."""
+    raw = f"{node.created_at.isoformat()}|{node.id}".encode()
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: Any) -> tuple[datetime, str] | None:
+    """The ``(created_at, id)`` keyset of a cursor, or None when it is malformed."""
+    if not isinstance(cursor, str) or not _CURSOR_RE.match(cursor):
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode("utf-8")
+        created_at, sep, node_id = raw.partition("|")
+        if not sep:
+            return None
+        return _parse_iso_utc(created_at), str(uuid.UUID(node_id))
+    except (binascii.Error, ValueError):  # UnicodeDecodeError is a ValueError
+        return None
+
+
 class _Scope:
     """Result of ``MCPToolHandler._resolve_scope`` (D06).
 
@@ -263,11 +309,18 @@ class _Validated:
     source_agent: str = "claude"
     promoted_from: str | None = None
     supersedes: tuple[str, str] | None = None  # (old node id, reason)
+    on_behalf_of: dict[str, Any] | None = None  # never copied from a superseded node
 
 
 _ON_EXISTING = ("skip", "amend", "error")
 _SLUG_RE = re.compile(SLUG_PATTERN)
 _EXTERNAL_ID_MAX = 256
+_CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+_LIST_BATCH = 200       # rows read per storage call when a filter runs in this layer
+_LIST_SCAN_CAP = 2000   # category is encrypted in production, so it can't be filtered in SQL
+_LIST_MAX_LIMIT = 100
+_HISTORY_CAP = 50
+_RELATED_CAP = 20
 
 
 class MCPToolHandler:
@@ -349,10 +402,17 @@ class MCPToolHandler:
             "detail": dict(detail or {}),
             "client": dict(current_client.get({})),
         }
+        embed = current_embed.get()
+        if embed is not None:
+            event["detail"]["on_behalf_of"] = dict(embed["viewer"])
+            event["detail"]["embed_token_id"] = embed["token_id"]
         try:
             await self.audit.record(event)
         except Exception:
             logger.warning("audit record failed for %s on %s", action, space_id, exc_info=True)
+
+    # Public name for host code that records its own events (embed.mint, embed.revoke).
+    audit_event = _audit_event
 
     async def _audit_denied(self, space_id: str, code: str, need: SpaceRole | None) -> None:
         """``access.denied`` against a real space (spec 8.1)."""
@@ -483,7 +543,14 @@ class MCPToolHandler:
         ``"personal"`` = personal only. ``allow_archived`` defaults to True for
         reads and False for writes (``need_role`` writer/owner). The caller MUST
         call ``reset()`` on the result (``try/finally``).
+
+        With an embed token bound, ``space``, ``spaces``, ``include_personal``
+        and ``default_scope`` are ignored: the scope is the token's space, with
+        the role and archive checks still applied.
         """
+        embed = current_embed.get()
+        if embed is not None:
+            space, spaces, include_personal = embed["space_id"], None, False
         if space is not None and spaces is not None:
             return _Scope(error=_error("invalid_arguments", "pass either `space` or `spaces`, not both"))
         if spaces is not None and (not isinstance(spaces, list) or not all(isinstance(s, str) for s in spaces)):
@@ -576,6 +643,9 @@ class MCPToolHandler:
         A space node sees only its space; a personal node sees personal + org,
         exactly as before spaces existed.
         """
+        embed = current_embed.get()
+        if embed is not None:
+            space_id = embed["space_id"]
         t1 = current_scope_space_ids.set([space_id] if space_id else [])
         t2 = current_include_personal.set(space_id is None)
         try:
@@ -612,6 +682,12 @@ class MCPToolHandler:
             await self._audit_denied(sid, "insufficient_role", SpaceRole.WRITER)
             return _error("insufficient_role", "This action needs the writer role in the space")
         return None
+
+    @staticmethod
+    def _target_space(space: str | None, scope: _Scope) -> str | None:
+        """The space a write goes to: the named one, or always the embed token's."""
+        named = space is not None or current_embed.get() is not None
+        return scope.space_ids[0] if named and scope.space_ids else None
 
     @staticmethod
     def _space_label(space_id: str | None, labels: dict[str, Space] | None) -> dict[str, Any] | None:
@@ -651,6 +727,7 @@ class MCPToolHandler:
         space: str | None = None,
         external_id: str | None = None,
         on_existing: str = "amend",
+        on_behalf_of: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Store a new memory. Returns the node ID.
 
@@ -680,6 +757,11 @@ class MCPToolHandler:
             external_id: The caller's own id for this memory (unique per space
                 among current memories). ``on_existing`` decides what happens
                 when a current memory already carries it.
+            on_behalf_of: The viewer ``{id, email?, name?, via?}`` this write is
+                for. Set by trusted host code only; deliberately not an MCP
+                argument. Ignored when an embed token is bound (its viewer is
+                stamped instead), and not part of "identical" for
+                ``on_existing``.
 
         Validation (visibility, edge types, ids, refs, tags, same-space
         targets) runs completely before anything is written. The result may
@@ -687,11 +769,15 @@ class MCPToolHandler:
         numeric/negation divergence against auto-link candidates), not verified
         contradictions, and never materialized as edges.
         """
+        try:
+            attribution = _check_on_behalf_of(on_behalf_of)
+        except ValidationFailure as exc:
+            return exc.as_error()
         scope = await self._resolve_scope(space, None, None, SpaceRole.WRITER, "memberships")
         if scope.error is not None:
             return scope.error
         try:
-            space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
+            space_id = self._target_space(space, scope)
             validated = await self._validate_store(_StoreRequest(
                 content=content,
                 source_session=source_session,
@@ -709,6 +795,7 @@ class MCPToolHandler:
             ))
             if isinstance(validated, dict):
                 return validated
+            validated.on_behalf_of = attribution
             if validated.existing is not None:
                 result = await self._apply_on_existing(validated)
             else:
@@ -871,6 +958,8 @@ class MCPToolHandler:
         summary = _truncate_summary(content)
 
         ts = v.created_at
+        embed = current_embed.get()
+        on_behalf_of = {**embed["viewer"], "via": "embed"} if embed is not None else v.on_behalf_of
         # A superseding node takes the external_id only after the SUPERSEDES
         # edge: on Postgres that edge is what frees the unique slot (D17).
         moved_external_id = v.external_id if v.supersedes is not None else None
@@ -895,6 +984,7 @@ class MCPToolHandler:
             space_id=v.space_id,
             external_id=None if moved_external_id is not None else v.external_id,
             promoted_from=v.promoted_from,
+            on_behalf_of=on_behalf_of,
         )
 
         node_id = await self.graph.create_node(node)
@@ -1050,6 +1140,7 @@ class MCPToolHandler:
     async def memory_amend(
         self, node_id: str, content: str, reason: str | None = None,
         refs: list[dict[str, Any]] | None = None, tags: list[str] | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record a correction: create a new memory that supersedes an old one.
 
@@ -1060,8 +1151,14 @@ class MCPToolHandler:
 
         ``refs``/``tags``: None copies the old memory's values; a list replaces
         them exactly. The new node keeps the old node's space and external_id
-        (so an external_id follows the amendment).
+        (so an external_id follows the amendment). ``on_behalf_of`` is as in
+        ``memory_store``; it describes this write, so the old node's value is
+        not inherited.
         """
+        try:
+            attribution = _check_on_behalf_of(on_behalf_of)
+        except ValidationFailure as exc:
+            return exc.as_error()
         scope = await self._node_scope()
         try:
             old = await self.graph.get_node(node_id)
@@ -1070,7 +1167,7 @@ class MCPToolHandler:
             denied = await self._authorize_write(old, "Only the node owner can amend this memory")
             if denied is not None:
                 return denied
-            result = await self._amend_node(old, content, reason, refs, tags)
+            result = await self._amend_node(old, content, reason, refs, tags, attribution)
             if "error" in result:
                 return result
             new_id = result["node_id"]
@@ -1088,6 +1185,7 @@ class MCPToolHandler:
         reason: str | None,
         refs: list[Any] | None,
         tags: list[Any] | None,
+        on_behalf_of: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Shared amend routine (memory_amend, on_existing="amend"; D08).
 
@@ -1118,6 +1216,7 @@ class MCPToolHandler:
             created_at=datetime.now(UTC),
             external_id=old.external_id,
             supersedes=(str(old.id), reason or "amended"),
+            on_behalf_of=on_behalf_of,
         ))
 
     # -- idempotent writes (spec 9.4, 9.5) ----------------------------------------
@@ -1127,6 +1226,7 @@ class MCPToolHandler:
         items: list[dict[str, Any]],
         space: str | None = None,
         on_existing: str = "amend",
+        on_behalf_of: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Store up to ``config.BATCH_MAX_ITEMS`` memories into one scope (spec 9.4).
 
@@ -1143,6 +1243,8 @@ class MCPToolHandler:
         Retry safety: when every item carries an ``external_id`` the whole
         batch is idempotent (a resend returns the same node ids with status
         ``unchanged``), so a client may retry it after a timeout.
+
+        ``on_behalf_of`` is as in ``memory_store`` and applies to every item.
         """
         from papez.engine import config
 
@@ -1155,12 +1257,16 @@ class MCPToolHandler:
             )
         if on_existing not in _ON_EXISTING:
             return _error("invalid_arguments", "on_existing must be one of 'skip', 'amend', 'error'")
+        try:
+            attribution = _check_on_behalf_of(on_behalf_of)
+        except ValidationFailure as exc:
+            return exc.as_error()
 
         scope = await self._resolve_scope(space, None, None, SpaceRole.WRITER, "memberships")
         if scope.error is not None:
             return scope.error
         try:
-            space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
+            space_id = self._target_space(space, scope)
             problems: list[dict[str, Any]] = []
             plans: list[tuple[_Validated, list[tuple[int, EdgeType]]]] = []
             seen_external: set[str] = set()
@@ -1179,6 +1285,7 @@ class MCPToolHandler:
             failure: dict[str, Any] | None = None
             async with self._atomic():
                 for index, (v, index_links) in enumerate(plans):
+                    v.on_behalf_of = attribution
                     for ref_index, etype in index_links:
                         target = results[ref_index]["node_id"]
                         if target not in {t for t, _ in v.related}:
@@ -1299,6 +1406,7 @@ class MCPToolHandler:
         ref_id: str,
         space: str | None = None,
         mode: str = "amend",
+        on_behalf_of: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Retire the memories that cite a removed source (spec 9.5).
 
@@ -1312,7 +1420,8 @@ class MCPToolHandler:
         memory is left alone, so a repeat call is a no-op). A memory with other
         refs is amended with this ref removed. ``mode="delete"``: sole-ref
         memories are deleted, the others amended with the ref removed.
-        Returns ``{"retired", "updated", "deleted"}``.
+        Returns ``{"retired", "updated", "deleted"}``. ``on_behalf_of`` is as
+        in ``memory_store`` and applies to the amended nodes.
         """
         from papez.engine import config
 
@@ -1320,11 +1429,15 @@ class MCPToolHandler:
             return _error("invalid_arguments", "mode must be 'amend' or 'delete'")
         if not isinstance(ref_type, str) or not ref_type or not isinstance(ref_id, str) or not ref_id:
             return _error("invalid_arguments", "ref_type and ref_id must be non-empty strings")
+        try:
+            attribution = _check_on_behalf_of(on_behalf_of)
+        except ValidationFailure as exc:
+            return exc.as_error()
         scope = await self._resolve_scope(space, None, None, SpaceRole.WRITER, "personal")
         if scope.error is not None:
             return scope.error
         try:
-            space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
+            space_id = self._target_space(space, scope)
             counts = {"retired": 0, "updated": 0, "deleted": 0}
             audit_rows: list[tuple[str, list[str]]] = []
             nodes = await self.graph.find_nodes_by_ref(ref_type, ref_id)
@@ -1349,6 +1462,7 @@ class MCPToolHandler:
                         result = await self._amend_node(
                             node, node.content_full or node.content_summary,
                             f"ref {ref_type}:{ref_id} removed", [_ref_dump(r) for r in remaining], None,
+                            attribution,
                         )
                         if "error" in result:
                             return result
@@ -1369,6 +1483,7 @@ class MCPToolHandler:
                         keep = [t for t in node.tags if t != "retired"][: max(config.MAX_TAGS_PER_MEMORY - 1, 0)]
                         result = await self._amend_node(
                             node, content, f"source {ref_type}:{ref_id} removed", None, [*keep, "retired"],
+                            attribution,
                         )
                         if "error" in result:
                             return result
@@ -1395,6 +1510,8 @@ class MCPToolHandler:
         space: str | None = None,
         spaces: list[str] | None = None,
         include_personal: bool | None = None,
+        category: str | None = None,
+        exclude_superseded: bool = False,
     ) -> dict[str, Any]:
         """Recall memories by hybrid search; see ``_recall`` for the ranking.
 
@@ -1402,7 +1519,9 @@ class MCPToolHandler:
         spaces (personal memory then only with ``include_personal=True``);
         with neither, every non-archived membership plus personal memory.
         ``tags_any``/``ref_type`` filter candidates BEFORE ranking (storage
-        level), so ``k`` matching results still come back.
+        level), so ``k`` matching results still come back. ``category`` and
+        ``exclude_superseded`` filter here after decryption, over an
+        over-fetched candidate set (``min(k*4, 400)``).
         """
         from papez.engine import config
 
@@ -1414,6 +1533,10 @@ class MCPToolHandler:
             return exc.as_error()
         if ref_type is not None and not isinstance(ref_type, str):
             return _error("invalid_arguments", "ref_type must be a string")
+        if category is not None and not isinstance(category, str):
+            return _error("invalid_arguments", "category must be a string")
+        if not isinstance(exclude_superseded, bool):
+            return _error("invalid_arguments", "exclude_superseded must be a boolean")
         scope = await self._resolve_scope(space, spaces, include_personal, None, "memberships")
         if scope.error is not None:
             return scope.error
@@ -1421,6 +1544,7 @@ class MCPToolHandler:
             out = await self._recall(
                 query, k, max_results, read_only, verbosity, min_results,
                 tags_any=norm_tags or None, ref_type=ref_type or None, labels=scope.spaces,
+                category=category, exclude_superseded=exclude_superseded,
             )
             if "error" not in out:
                 await self._audit_reads(
@@ -1443,13 +1567,16 @@ class MCPToolHandler:
         tags_any: list[str] | None = None,
         ref_type: str | None = None,
         labels: dict[str, Space] | None = None,
+        category: str | None = None,
+        exclude_superseded: bool = False,
     ) -> dict[str, Any]:
         """Recall memories by hybrid search: vector + keyword, ranked by vector similarity.
 
-        verbosity: "full" (default; unchanged payload) or "concise". Concise
-        hits carry only id/summary/status/score/activation/is_core (plus
-        superseded_by when set); the expensive causal-chain queries are skipped
-        entirely. Reactivation writes still happen in both modes (governed by
+        verbosity: "full" (default; unchanged payload), "concise" or "light".
+        Concise hits carry only id/summary/status/score/activation/is_core (plus
+        superseded_by when set); light hits are full hits with empty causal
+        fields. Both skip the expensive causal-chain queries entirely.
+        Reactivation writes still happen in every mode (governed by
         read_only, not verbosity).
 
         min_results: zero-results floor. When the min-similarity gate would
@@ -1462,7 +1589,7 @@ class MCPToolHandler:
         """
         import asyncio
 
-        if verbosity not in ("full", "concise"):
+        if verbosity not in ("full", "concise", "light"):
             logger.warning("memory_recall verbosity=%r unrecognized; using 'full'", verbosity)
             verbosity = "full"
 
@@ -1510,7 +1637,11 @@ class MCPToolHandler:
             search_filters["tags_any"] = tags_any
         if ref_type:
             search_filters["ref_type"] = ref_type
-        kw_coros = [self.graph.keyword_search(t, k=k, org_ids=org_ids, **search_filters) for t in search_terms]
+        # category and exclude_superseded are applied below, in this layer, so
+        # fetch more candidates than asked for and cut back to k after dropping.
+        drop_after_fetch = category is not None or exclude_superseded
+        fetch_k = max(k, min(k * 4, 400)) if drop_after_fetch else k
+        kw_coros = [self.graph.keyword_search(t, k=fetch_k, org_ids=org_ids, **search_filters) for t in search_terms]
         if self.embeddings:
             embed_and_kw: list[Any] = await asyncio.gather(self.embeddings.embed(query), *kw_coros)
             embedding: list[float] = embed_and_kw[0]
@@ -1523,8 +1654,17 @@ class MCPToolHandler:
         min_sim = engine_config.resolve_recall_min_similarity(self.embeddings)
 
         vector_results = (
-            await self.graph.vector_search(embedding, k=k, org_ids=org_ids, **search_filters) if embedding else []
+            await self.graph.vector_search(embedding, k=fetch_k, org_ids=org_ids, **search_filters) if embedding else []
         )
+        if drop_after_fetch:
+            found = [n for n, _ in vector_results] + [n for nodes in kw_results_per_term for n in nodes]
+            dropped = await self._superseded_among(found) if exclude_superseded else set()
+
+            def keep(node: MemoryNode) -> bool:
+                return (category is None or node.category == category) and str(node.id) not in dropped
+
+            vector_results = [(n, s) for n, s in vector_results if keep(n)][:k]
+            kw_results_per_term = [[n for n in nodes if keep(n)][:k] for nodes in kw_results_per_term]
 
         # 2. Collect keyword hits. kw_coverage[nid] = how many distinct query
         # terms matched this node — the lexical-relevance signal I3-2's RRF ranks
@@ -1655,6 +1795,11 @@ class MCPToolHandler:
         # the contract of pin_memory (always available regardless of query).
         core_min_sim = engine_config.resolve_core_inject_min_similarity(self.embeddings)
         core_nodes = await self.graph.get_nodes_by_status(MemoryStatus.CORE, limit=50)
+        if category is not None:
+            core_nodes = [n for n in core_nodes if n.category == category]
+        if exclude_superseded:
+            superseded_core = await self._superseded_among(core_nodes)
+            core_nodes = [n for n in core_nodes if str(n.id) not in superseded_core]
         seen_ids = set(merged.keys())
         core_candidates: list[tuple[MemoryNode, float]] = []
         for cnode in core_nodes:
@@ -1757,10 +1902,10 @@ class MCPToolHandler:
         memories = memories[:cap]
 
         # Enrich top results with causal chains (batch fetch). Skipped entirely
-        # in concise mode — the chain queries are the main latency cost.
+        # in concise and light modes — the chain queries are the main latency cost.
         org_ids_for_chain = current_org_ids.get([])
         mem_ids_for_chain = [m["id"] for m in memories if m.get("id")]
-        if verbosity != "concise" and mem_ids_for_chain:
+        if verbosity == "full" and mem_ids_for_chain:
             try:
                 has_batch = hasattr(self.graph, "get_causal_chains_batch")
                 if has_batch:
@@ -1892,6 +2037,19 @@ class MCPToolHandler:
             "refs": [_ref_dump(r) for r in node.refs],
             "tags": list(node.tags),
             "space": self._space_label(node.space_id, labels),
+            "on_behalf_of": node.on_behalf_of,
+            "category": node.category,
+            "created_by": node.original_user_id,
+        }
+
+    async def _superseded_among(self, nodes: list[MemoryNode]) -> set[str]:
+        """Ids among ``nodes`` that a newer visible memory supersedes (edge target = old)."""
+        ids = {str(n.id) for n in nodes}
+        if not ids:
+            return set()
+        return {
+            str(e.target_id) for e in await self.graph.get_all_edges(sorted(ids))
+            if e.type == EdgeType.SUPERSEDES and str(e.target_id) in ids
         }
 
     @staticmethod
@@ -1952,6 +2110,8 @@ class MCPToolHandler:
             "refs": [_ref_dump(r) for r in node.refs],
             "tags": list(node.tags),
             "space": MCPToolHandler._space_label(node.space_id, labels),
+            "on_behalf_of": node.on_behalf_of,
+            "created_by": node.original_user_id,
         }
 
     async def memory_search(
@@ -2267,6 +2427,8 @@ class MCPToolHandler:
             "refs": [_ref_dump(r) for r in node.refs],
             "tags": list(node.tags),
             "space": self._space_label(node.space_id, labels),
+            "on_behalf_of": node.on_behalf_of,
+            "created_by": node.original_user_id,
             "is_orphan": is_orphan,
             "upstream_count": len(upstream),
             "downstream_count": len(downstream),
@@ -2421,6 +2583,9 @@ class MCPToolHandler:
         excluded: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update core memory category preferences."""
+        refused = _embed_refusal()
+        if refused is not None:
+            return refused
         result = await self.preferences.update(auto=auto, approval=approval, excluded=excluded)
         return {"status": "updated", "preferences": result}
 
@@ -2549,6 +2714,9 @@ class MCPToolHandler:
                 is scrubbed from connected edge reasons. If False, all nodes
                 are deleted regardless of visibility.
         """
+        refused = _embed_refusal()
+        if refused is not None:
+            return refused
         uid = _caller_uid()
         if uid is None:
             raise PermissionError("current_user_id not set — cannot erase")
@@ -2602,6 +2770,7 @@ class MCPToolHandler:
             "description": space.description,
             "forgetting_policy": _role_value(space.forgetting_policy),
             "llm_inference_enabled": space.llm_inference_enabled,
+            "show_service_names": space.show_service_names,
             "archived": space.archived,
             "archived_at": space.archived_at.isoformat() if space.archived_at else None,
             "created_at": space.created_at.isoformat(),
@@ -2641,10 +2810,17 @@ class MCPToolHandler:
     async def _space_for(
         self, space: str, need_role: SpaceRole, *, allow_archived: bool | None = None,
     ) -> tuple[Space, str] | dict[str, Any]:
-        """Resolve ``space`` for a space-management tool; returns (Space, role) or an error."""
+        """Resolve ``space`` for a space-management tool; returns (Space, role) or an error.
+
+        Owner-level management is never reachable through an embed token.
+        """
         missing = self._registry_error()
         if missing is not None:
             return missing
+        if need_role == SpaceRole.OWNER:
+            refused = _embed_refusal()
+            if refused is not None:
+                return refused
         if not isinstance(space, str) or not space:
             return _space_not_found()
         scope = await self._resolve_scope(space, None, None, need_role, allow_archived=allow_archived)
@@ -2665,6 +2841,7 @@ class MCPToolHandler:
         description: str | None = None,
         forgetting_policy: str = "retain_all",
         llm_inference_enabled: bool = True,
+        show_service_names: bool = True,
     ) -> dict[str, Any]:
         """Create a space; the caller becomes its first owner. Users only."""
         from papez.storage.spaces import unique_slug
@@ -2672,6 +2849,9 @@ class MCPToolHandler:
         missing = self._registry_error()
         if missing is not None:
             return missing
+        refused = _embed_refusal()
+        if refused is not None:
+            return refused
         assert self.spaces is not None
         uid = _caller_uid()
         if uid is None:
@@ -2696,6 +2876,8 @@ class MCPToolHandler:
             return _error("invalid_arguments", "forgetting_policy must be 'retain_all' or 'standard'")
         if not isinstance(llm_inference_enabled, bool):
             return _error("invalid_arguments", "llm_inference_enabled must be a boolean")
+        if not isinstance(show_service_names, bool):
+            return _error("invalid_arguments", "show_service_names must be a boolean")
         if slug is not None:
             if not isinstance(slug, str) or not _SLUG_RE.match(slug):
                 return _error("invalid_arguments", "slug must match ^[a-z0-9][a-z0-9-]{1,62}$")
@@ -2718,6 +2900,7 @@ class MCPToolHandler:
                 forgetting_policy=policy,
                 llm_inference_enabled=llm_inference_enabled,
                 created_by=uid,
+                show_service_names=show_service_names,
             )
         except (ValueError, TypeError) as exc:  # pydantic ValidationError is a ValueError
             return _error("invalid_arguments", f"invalid space: {exc.__class__.__name__}")
@@ -2748,6 +2931,9 @@ class MCPToolHandler:
         if uid is None:
             raise PermissionError("current_user_id not set — cannot list spaces")
         pairs = await self.spaces.list_spaces_for_principal(uid, include_archived=bool(include_archived))
+        embed = current_embed.get()
+        if embed is not None:
+            pairs = [(space, role) for space, role in pairs if space.id == embed["space_id"]]
         items = [await self._space_with_counts(space, role) for space, role in pairs]
         items.sort(key=lambda d: (str(d["name"]).lower(), d["id"]))
         return {"spaces": items}
@@ -2767,6 +2953,7 @@ class MCPToolHandler:
         description: str | None = None,
         forgetting_policy: str | None = None,
         llm_inference_enabled: bool | None = None,
+        show_service_names: bool | None = None,
     ) -> dict[str, Any]:
         """Change name/description/policies (owner). The slug never changes."""
         hit = await self._space_for(space, SpaceRole.OWNER)
@@ -2790,6 +2977,10 @@ class MCPToolHandler:
             if not isinstance(llm_inference_enabled, bool):
                 return _error("invalid_arguments", "llm_inference_enabled must be a boolean")
             updates["llm_inference_enabled"] = llm_inference_enabled
+        if show_service_names is not None:
+            if not isinstance(show_service_names, bool):
+                return _error("invalid_arguments", "show_service_names must be a boolean")
+            updates["show_service_names"] = show_service_names
         if not updates:
             return {"space": self._space_dict(found, role)}
         try:
@@ -2984,3 +3175,229 @@ class MCPToolHandler:
             return {"node_id": result["node_id"], "space": label}
         finally:
             outer.reset()
+
+    # -- Space read API (embeddable space view; handler methods, not MCP tools) ---
+
+    async def _named_space_scope(self, space: Any) -> _Scope:
+        """Reader scope for one named space; archived spaces stay readable.
+
+        Under an embed token ``_resolve_scope`` replaces ``space`` with the token's.
+        """
+        if current_embed.get() is None and (not isinstance(space, str) or not space):
+            return _Scope(error=_space_not_found())
+        return await self._resolve_scope(space, None, None, SpaceRole.READER)
+
+    def _space_hit(self, node: MemoryNode, labels: dict[str, Space] | None) -> dict[str, Any]:
+        """A list row: the concise recall shape plus content, refs and attribution."""
+        return {
+            "id": str(node.id),
+            "summary": node.content_summary,
+            "status": node.status.value,
+            "score": None,
+            "activation": round(node.decay_score, 4),
+            "is_core": node.status == MemoryStatus.CORE,
+            "tags": list(node.tags),
+            "ref_count": len(node.refs),
+            "space": self._space_label(node.space_id, labels),
+            "content": node.content_full or node.content_summary,
+            "refs": [_ref_dump(r) for r in node.refs],
+            "on_behalf_of": node.on_behalf_of,
+            "category": node.category,
+            "created_at": node.created_at.isoformat(),
+            "created_by": node.original_user_id,
+        }
+
+    async def space_memories(
+        self,
+        space: str,
+        sort: str = "recent",
+        limit: int = 20,
+        cursor: str | None = None,
+        tags_any: list[str] | None = None,
+        category: str | None = None,
+        include_superseded: bool = False,
+    ) -> dict[str, Any]:
+        """One page of a space's memories, newest first: ``{"items", "next_cursor"}``.
+
+        Category is filtered here after decryption, reading storage in batches
+        of 200 and at most 2000 rows per call. When that cap is hit before the
+        page fills, the page comes back short with ``next_cursor`` at the last
+        row read, so a further call continues the scan.
+        """
+        from papez.engine import config
+
+        if sort != "recent":
+            return _error("invalid_arguments", "sort must be 'recent'")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _LIST_MAX_LIMIT:
+            return _error("invalid_arguments", f"limit must be 1-{_LIST_MAX_LIMIT}")
+        before = None
+        if cursor is not None:
+            before = _decode_cursor(cursor)
+            if before is None:
+                return _error("invalid_arguments", "cursor is not valid")
+        if category is not None and not isinstance(category, str):
+            return _error("invalid_arguments", "category must be a string")
+        try:
+            norm_tags = normalize_tags(
+                tags_any, max_tag_length=config.MAX_TAG_LENGTH, max_tags=config.MAX_TAGS_PER_MEMORY,
+            ) if tags_any is not None else []
+        except ValidationFailure as exc:
+            return exc.as_error()
+        scope = await self._named_space_scope(space)
+        if scope.error is not None:
+            return scope.error
+        try:
+            sid = scope.space_ids[0]
+            matches: list[MemoryNode] = []
+            scanned = 0
+            last_read: MemoryNode | None = None
+            cap_hit = False
+            # One row past the page tells whether another page exists.
+            while len(matches) <= limit:
+                remaining = _LIST_SCAN_CAP - scanned
+                if remaining <= 0:
+                    cap_hit = True
+                    break
+                wanted = limit + 1 - len(matches) if category is None else _LIST_BATCH
+                batch = min(wanted, _LIST_BATCH, remaining)
+                rows = await self.graph.list_space_nodes(
+                    sid, limit=batch, before=before, tags_any=norm_tags or None,
+                    include_superseded=bool(include_superseded),
+                )
+                for node in rows:
+                    scanned += 1
+                    last_read = node
+                    if category is None or node.category == category:
+                        matches.append(node)
+                        if len(matches) > limit:
+                            break
+                if len(rows) < batch:
+                    break
+                before = (rows[-1].created_at, str(rows[-1].id))
+            page = matches[:limit]
+            next_cursor: str | None = None
+            if len(matches) > limit:
+                next_cursor = _encode_cursor(page[-1])
+            elif cap_hit and last_read is not None:
+                next_cursor = _encode_cursor(last_read)
+            items = [self._space_hit(n, scope.spaces) for n in page]
+            if include_superseded:
+                await self._tag_superseded(items)
+            await self._audit_event("memory.list", sid, [i["id"] for i in items], {"results": len(items)})
+            return {"items": items, "next_cursor": next_cursor}
+        finally:
+            scope.reset()
+
+    def _detail_hit(self, node: MemoryNode, labels: dict[str, Space] | None) -> dict[str, Any]:
+        """A light hit with no score: nothing was searched for."""
+        hit = self._format_memory_light(node, 0.0, labels)
+        hit["score"] = None
+        return hit
+
+    async def _history_of(self, node_id: str) -> list[MemoryNode]:
+        """Older versions reachable through outgoing SUPERSEDES edges, newest first."""
+        seen = {node_id}
+        queue = [node_id]
+        found: list[MemoryNode] = []
+        while queue and len(found) < _HISTORY_CAP:
+            for edge in await self.graph.get_edges(queue.pop(0), "outgoing", EdgeType.SUPERSEDES):
+                older_id = str(edge.target_id)
+                if older_id in seen:
+                    continue
+                seen.add(older_id)
+                older = await self.graph.get_node(older_id)
+                if older is not None:
+                    found.append(older)
+                    queue.append(older_id)
+        found.sort(key=lambda n: (n.created_at, str(n.id)), reverse=True)
+        return found[:_HISTORY_CAP]
+
+    async def _related_of(self, node_id: str) -> list[dict[str, Any]]:
+        """Linked memories through non-SUPERSEDES edges, either direction, one row per memory."""
+        edges = await self.graph.get_edges(node_id, "both")
+        edges.sort(key=lambda e: (e.created_at, str(e.id)), reverse=True)
+        seen = {node_id}
+        related: list[dict[str, Any]] = []
+        for edge in edges:
+            if edge.type == EdgeType.SUPERSEDES:
+                continue
+            other_id = str(edge.target_id) if str(edge.source_id) == node_id else str(edge.source_id)
+            if other_id in seen:
+                continue
+            seen.add(other_id)
+            other = await self.graph.get_node(other_id)
+            if other is None:
+                continue
+            related.append({"id": other_id, "type": edge.type.value, "preview": other.content_summary})
+            if len(related) >= _RELATED_CAP:
+                break
+        return related
+
+    async def memory_detail(
+        self, node_id: str, include: tuple[str, ...] | list[str] = ("history", "related"),
+    ) -> dict[str, Any]:
+        """One memory with its history and links: ``{"memory", "history", "related"}``.
+
+        A malformed, missing or invisible id gets the same ``not_found`` answer.
+        Uses the caller's memberships, archived ones included.
+        """
+        try:
+            canonical = str(uuid.UUID(node_id))
+        except (ValueError, AttributeError, TypeError):
+            return _not_found(str(node_id))
+        scope = await self._node_scope()
+        try:
+            node = await self.graph.get_node(canonical)
+            if node is None:
+                return _not_found(node_id)
+            labels = scope.spaces
+            memory = self._detail_hit(node, labels)
+            newer = await self.graph.get_edges(canonical, "incoming", EdgeType.SUPERSEDES)
+            if newer:
+                memory["superseded_by"] = str(max(newer, key=lambda e: (e.created_at, str(e.id))).source_id)
+            older = await self._history_of(canonical) if "history" in include else []
+            related = await self._related_of(canonical) if "related" in include else []
+            if node.space_id is not None:
+                returned = [canonical, *(str(n.id) for n in older), *(r["id"] for r in related)]
+                await self._audit_reads(
+                    "memory.explain", [node.space_id], [(i, node.space_id) for i in returned], 0,
+                )
+            return {
+                "memory": memory,
+                "history": [self._detail_hit(n, labels) for n in older],
+                "related": related,
+            }
+        finally:
+            scope.reset()
+
+    async def space_tags(self, space: str, limit: int = 12) -> dict[str, Any]:
+        """Top tags of a space, plus the categories among its newest 2000 current rows."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _LIST_MAX_LIMIT:
+            return _error("invalid_arguments", f"limit must be 1-{_LIST_MAX_LIMIT}")
+        scope = await self._named_space_scope(space)
+        if scope.error is not None:
+            return scope.error
+        try:
+            sid = scope.space_ids[0]
+            tags = await self.graph.space_tag_counts(sid, limit=limit)
+            counts: dict[str, int] = {}
+            before: tuple[datetime, str] | None = None
+            scanned = 0
+            while scanned < _LIST_SCAN_CAP:
+                batch = min(_LIST_BATCH, _LIST_SCAN_CAP - scanned)
+                rows = await self.graph.list_space_nodes(sid, limit=batch, before=before)
+                for node in rows:
+                    if node.category:
+                        counts[node.category] = counts.get(node.category, 0) + 1
+                scanned += len(rows)
+                if len(rows) < batch:
+                    break
+                before = (rows[-1].created_at, str(rows[-1].id))
+            categories = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            await self._audit_event("space.tags", sid, None, {"results": len(tags)})
+            return {
+                "tags": [{"tag": tag, "count": count} for tag, count in tags],
+                "categories": [{"category": name, "count": count} for name, count in categories],
+            }
+        finally:
+            scope.reset()

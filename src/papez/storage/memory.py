@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from papez.context import (
+    current_embed,
     current_include_personal,
     current_org_ids,
     current_principal_type,
@@ -393,6 +394,9 @@ class InMemoryGraphProvider:
     def _scope(self, org_ids: list[str] | None = None, space_ids: list[str] | None = None) -> _Scope:
         """Build the per-call scope; fails closed (RuntimeError) without a user."""
         uid = _uid()
+        embed = current_embed.get()
+        if embed is not None:
+            return _Scope(uid=uid, org_ids=frozenset(), space_ids=frozenset({embed["space_id"]}), include_personal=False)
         include_personal = bool(current_include_personal.get(True)) and current_principal_type.get("user") != "service"
         return _Scope(
             uid=uid,
@@ -497,7 +501,7 @@ class InMemoryGraphProvider:
         scope = self._scope()
         loc = self._locate(node_id)
         if loc is None:
-            return scope.uid
+            return None if current_embed.get() is not None else scope.uid
         if not is_visible(loc[1], loc[0], scope):
             return None
         return loc[0]
@@ -529,7 +533,14 @@ class InMemoryGraphProvider:
     async def initialize(self, user_id: str) -> None:
         self._load()
 
+    @staticmethod
+    def _refuse_under_embed(operation: str) -> None:
+        """Whole-user and whole-space deletes are never reachable through an embed."""
+        if current_embed.get() is not None:
+            raise PermissionError(f"{operation} is not allowed with an embed token")
+
     async def destroy(self, user_id: str) -> None:
+        self._refuse_under_embed("destroy")
         doomed = set(self._user_nodes.get(user_id, {}))
         self._drop_bucket_indexes(user_id)
         self._user_nodes.pop(user_id, None)
@@ -540,6 +551,7 @@ class InMemoryGraphProvider:
         self._save()
 
     async def erase_user(self, user_id: str, keep_promoted_nodes: bool = True) -> dict[str, int]:
+        self._refuse_under_embed("erase_user")
         import re
         _PII_RE = re.compile(
             r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+|"
@@ -640,6 +652,9 @@ class InMemoryGraphProvider:
     # -- Node CRUD --------------------------------------------------------------
 
     async def create_node(self, node: MemoryNode) -> str:
+        embed = current_embed.get()
+        if embed is not None and node.space_id != embed["space_id"]:
+            raise ValueError("an embed token can only write to its own space")
         nid = str(node.id)
         if node.space_id is not None:
             bucket = space_bucket_key(node.space_id)
@@ -688,6 +703,8 @@ class InMemoryGraphProvider:
         scope = self._scope()
         loc = self._locate(node_id)
         if loc is None:
+            if current_embed.get() is not None:
+                return  # never touches the issuer's personal edges
             # Unknown id: legacy behaviour, drop the caller's edges touching it.
             self._purge_edges_touching({node_id}, [scope.uid])
             self._save()
@@ -714,6 +731,9 @@ class InMemoryGraphProvider:
         tgt = self._locate(target_id)
         src_space = src[1].space_id if src else None
         tgt_space = tgt[1].space_id if tgt else None
+        embed = current_embed.get()
+        if embed is not None and (src_space != embed["space_id"] or tgt_space != embed["space_id"]):
+            raise ValueError("cross_space_edge")
         if src_space is None and tgt_space is None:
             return _uid()  # both personal/org or missing: caller's bucket, as before
         if src is None or tgt is None or src_space != tgt_space:
@@ -758,7 +778,8 @@ class InMemoryGraphProvider:
         for bucket in dict.fromkeys([b for b in (self._edge_bucket.get(edge_id), scope.uid) if b is not None]):
             for e in self._user_edges.get(bucket, []):
                 if str(e.id) == edge_id:
-                    if bucket == scope.uid or self._edge_visible(e, scope):
+                    own = bucket == scope.uid and current_embed.get() is None
+                    if own or self._edge_visible(e, scope):
                         return bucket, e
                     return None
         return None
@@ -1056,6 +1077,7 @@ class InMemoryGraphProvider:
 
     async def erase_space(self, space_id: str, dry_run: bool = False) -> dict[str, int]:
         """Delete a space's bucket, its indexes and any edge elsewhere touching its nodes."""
+        self._refuse_under_embed("erase_space")
         bucket = space_bucket_key(space_id)
         node_ids = set(self._user_nodes.get(bucket, {}))
         own_edges = len(self._user_edges.get(bucket, []))
@@ -1078,6 +1100,47 @@ class InMemoryGraphProvider:
         self._node_locks = {k: v for k, v in self._node_locks.items() if k not in node_ids}
         self._save()
         return counts
+
+    def _space_nodes_in_scope(self, space_id: str) -> dict[str, MemoryNode]:
+        """The nodes of one space, or nothing when the space is out of the caller's scope."""
+        scope = self._scope()
+        if space_id not in scope.space_ids:
+            return {}
+        bucket = space_bucket_key(space_id)
+        return {
+            nid: node for nid, node in self._user_nodes.get(bucket, {}).items()
+            if is_visible(node, bucket, scope)
+        }
+
+    async def list_space_nodes(
+        self, space_id: str, *, limit: int = 20, before: tuple[datetime, str] | None = None,
+        tags_any: list[str] | None = None, include_superseded: bool = False,
+    ) -> list[MemoryNode]:
+        """A space's nodes, newest first on ``(created_at desc, id desc)``; ``before`` is exclusive."""
+        bucket = space_bucket_key(space_id)
+        rows: list[MemoryNode] = []
+        for nid, node in self._space_nodes_in_scope(space_id).items():
+            if before is not None and (node.created_at, nid) >= before:
+                continue
+            if not self._passes_search_filters(node, tags_any, None):
+                continue
+            if not include_superseded and self._is_superseded(bucket, nid):
+                continue
+            rows.append(node)
+        rows.sort(key=lambda n: (n.created_at, str(n.id)), reverse=True)
+        return rows[: max(limit, 0)]
+
+    async def space_tag_counts(self, space_id: str, limit: int = 12) -> list[tuple[str, int]]:
+        """Tags of the space's non-superseded nodes, count desc then tag asc."""
+        bucket = space_bucket_key(space_id)
+        counts: dict[str, int] = defaultdict(int)
+        for nid, node in self._space_nodes_in_scope(space_id).items():
+            if self._is_superseded(bucket, nid):
+                continue
+            for tag in node.tags:
+                counts[tag] += 1
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return ranked[: max(limit, 0)]
 
     # -- Misc -------------------------------------------------------------------
 

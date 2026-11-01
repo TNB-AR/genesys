@@ -111,10 +111,10 @@ An edge may only connect two nodes with the same `space_id`: both personal/org, 
 
 | Tool | Notes |
 |---|---|
-| `space_create(name, slug=None, org_id=None, description=None, forgetting_policy="retain_all", llm_inference_enabled=True)` | The caller becomes the first owner. Without `slug`, one is generated from the name (lowercased, spaces to `-`, invalid characters removed, `-2`, `-3`... if taken). A given slug that is already used in the org returns `slug_taken`. `org_id` defaults to the caller's only org; with several orgs it is required. Services can't create spaces. Returns `{"space": {..., "your_role": "owner"}}`. |
+| `space_create(name, slug=None, org_id=None, description=None, forgetting_policy="retain_all", llm_inference_enabled=True, show_service_names=True)` | The caller becomes the first owner. Without `slug`, one is generated from the name (lowercased, spaces to `-`, invalid characters removed, `-2`, `-3`... if taken). A given slug that is already used in the org returns `slug_taken`. `org_id` defaults to the caller's only org; with several orgs it is required. Services can't create spaces. Returns `{"space": {..., "your_role": "owner"}}`. |
 | `space_list(include_archived=False)` | The caller's spaces, sorted by name, each with `your_role`, `member_count`, `memory_count`. |
 | `space_get(space)` | Reader+. Adds `member_count`, `memory_count`, `your_role`. |
-| `space_update(space, name=None, description=None, forgetting_policy=None, llm_inference_enabled=None)` | Owner. The slug can't be changed. |
+| `space_update(space, name=None, description=None, forgetting_policy=None, llm_inference_enabled=None, show_service_names=None)` | Owner. The slug can't be changed. |
 | `space_member_add(space, principal_id, principal_type, role)` | Owner. Adding an existing member changes their role. A service can't be `owner` (`invalid_arguments`). Returns `{"member": {...}, "created": bool}`. |
 | `space_member_remove(space, principal_id)` | Owner. Removing the last user owner returns `last_owner`. Removing a non-member returns `{"removed": true}`. |
 | `space_member_list(space)` | Reader+. `{"members": [{principal_id, principal_type, role, added_by, added_at}]}`. |
@@ -123,7 +123,7 @@ An edge may only connect two nodes with the same `space_id`: both personal/org, 
 | `space_erase(space, confirm_slug, dry_run=False)` | Owner. Permanently deletes the space and every memory and edge in it. `confirm_slug` must equal the slug exactly (`confirmation_mismatch`). With `dry_run=true` it returns the counts and deletes nothing. Returns `{"erased": {"space_id", "nodes", "edges", "members"}, "dry_run": bool}`. The space id is never reused. Audit events about the space are kept. |
 | `promote_to_space(node_id, space, keep_original=True)` | Writer+ in the target space. Copies one of your own personal memories into the space: content, summary, category, refs, tags, creation time, source agent and session. The copy records `promoted_from`. Edges are not copied. With `keep_original=false` the personal original is deleted. Returns `{"node_id", "space"}`. |
 
-Space object shape: `{"id", "slug", "name", "org_id", "description", "forgetting_policy", "llm_inference_enabled", "archived", "archived_at", "created_at", "created_by"}`, plus `your_role` where the caller is a member.
+Space object shape: `{"id", "slug", "name", "org_id", "description", "forgetting_policy", "llm_inference_enabled", "show_service_names", "archived", "archived_at", "created_at", "created_by"}`, plus `your_role` where the caller is a member.
 
 Membership changes take effect on the member's next call. The stdio server reloads the caller's roles from the registry before every tool call.
 
@@ -231,6 +231,24 @@ The `retryable` flag on a failed tool call is `true` for:
 
 `memory_store` with an `external_id` is idempotent too, so a client can resend it safely; the server still reports `retryable: false` for it, because the flag is per tool and `memory_store` without an `external_id` is not safe to retry.
 
+## Attribution and embed scope
+
+`on_behalf_of` is the person a memory was written for: `{"id", "email", "name", "via"}`, with `via` either `"embed"` or `"api"`. `id` is required (1-128 characters), `email` must look like an address (at most 254), `name` is at most 120; otherwise the error is `invalid_viewer`. `created_by` in results is the principal that holds the credential.
+
+`on_behalf_of` is a parameter of the Python handler methods `memory_store`, `memory_store_batch`, `memory_amend` and `memory_retire_by_ref`. It isn't in the MCP schema, so an MCP caller can't set it. A superseding node gets only what its own write passed, never the old node's value, and a change of viewer alone doesn't make an `on_existing` write count as different. Full and light recall hits, search hits and `memory_explain` show it; concise recall hits don't.
+
+When a host binds the `current_embed` context variable, storage and the tools stay on that one space. `space`, `spaces` and `include_personal` are ignored, personal memory and other spaces read as not found, role and archive checks still run, and every write is stamped with the token's viewer and `via: "embed"` whatever `on_behalf_of` says. `space_create`, owner-level space management, `erase_user` and `set_core_preferences` answer `embed_not_allowed`.
+
+## Space read methods
+
+Handler methods for hosts, not MCP tools. Each needs the reader role and also works on an archived space.
+
+| Method | Returns |
+|---|---|
+| `space_memories(space, sort="recent", limit=20, cursor=None, tags_any=None, category=None, include_superseded=False)` | `{"items", "next_cursor"}`, newest first. A bad `cursor`, a `limit` outside 1-100 or another `sort` is `invalid_arguments`. Each call reads at most 2000 rows looking for a `category`, so a page can come back short with a `next_cursor` to carry on from. |
+| `memory_detail(node_id, include=("history", "related"))` | `{"memory", "history", "related"}`. `history` is the chain of older versions, newest first, at most 50. `related` is at most 20 `{id, type, preview}` rows over other edge types. A malformed, missing or invisible id gets the same `not_found`. |
+| `space_tags(space, limit=12)` | `{"tags": [{"tag", "count"}], "categories": [{"category", "count"}]}`. Categories come from the newest 2000 current rows. |
+
 ## Audit events
 
 Every action that touches a space writes one event to the configured `AuditSink`. Personal actions write nothing. The in-memory sink keeps up to `GENESYS_AUDIT_MAX_EVENTS` (100000) events and does not persist them; the hosted product stores them in Postgres, append-only.
@@ -260,13 +278,16 @@ Events never contain memory content, query text, ref labels, space names or slug
 | `memory.delete`, `memory.pin`, `memory.unpin` | Those writes on space memories | |
 | `memory.promote_in` | `promote_to_space`; `node_ids` is `[new]` | `{promoted_from, keep_original}` |
 | `memory.recall`, `memory.search` | One event per space in scope, including spaces with 0 results | `{query_chars, results}` |
-| `memory.traverse`, `memory.explain` | One event for the start or target node's space (edges never cross spaces) | `{query_chars: 0, results}` |
+| `memory.traverse`, `memory.explain` | One event for the start or target node's space (edges never cross spaces). `memory_detail` emits `memory.explain`. | `{query_chars: 0, results}` |
+| `memory.list`, `space.tags` | `space_memories`, `space_tags` | `{results}` |
 | `space.create` | | `{org_id}` |
 | `space.update` | Only when something changed | `{fields}` (names only, never values) |
 | `space.archive`, `space.unarchive` | Unarchive of an active space emits nothing | `{}` |
 | `space.erase` | Real erase only, never a dry run | `{nodes, edges, members}` |
 | `member.add`, `member.role_change`, `member.remove` | | `{member_id, member_type, role, previous_role?}` |
 | `access.denied` | `space_not_found`, `insufficient_role` or `space_archived` returned for a real space, logged against the real space id | `{code, need_role}` |
+
+An event caused by an embed token also has `on_behalf_of` (the viewer) and `embed_token_id` in `detail`; `principal_id` stays the issuer.
 
 `node_ids` on read events are capped at `GENESYS_AUDIT_READ_NODE_IDS_CAP` (50); the `results` count is not capped. A probe for a space that doesn't exist logs nothing. A failing sink never breaks a tool call.
 
@@ -292,5 +313,7 @@ Every new error is `{"error": "<message>", "code": "<code>"}`. Existing errors k
 | `external_id_exists` | `on_existing="error"` and the id exists |
 | `batch_invalid` | One or more batch items are invalid, with per-item details |
 | `not_found` | A node id that doesn't exist or isn't visible. The two look identical. |
+| `invalid_viewer` | An `on_behalf_of` that fails validation |
+| `embed_not_allowed` | An operation that is never available with an embed token bound |
 
 Errors from the transport layer itself (an exception inside a tool, a missing required argument) keep the `{"error", "retryable"}` shape.

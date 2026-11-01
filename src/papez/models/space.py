@@ -22,6 +22,7 @@ class Space(BaseModel):
     created_by: str                               # principal id
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     archived_at: datetime | None = None           # set = archived (read-only, hidden from default recall)
+    show_service_names: bool = True               # if False, embed author lines don't name the credential
 
     @property
     def archived(self) -> bool:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -66,6 +67,11 @@ class MemoryNode(BaseModel):
 
     # Id of the personal node this space node was copied from (promote_to_space, D29).
     promoted_from: str | None = None
+
+    # The person this memory was written for, when a host vouched for one:
+    # {"id", "email", "name", "via": "embed" | "api"}. original_user_id stays the
+    # credential's principal. A superseding node never inherits this value.
+    on_behalf_of: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _space_nodes_are_private(self) -> MemoryNode:

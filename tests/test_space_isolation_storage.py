@@ -234,6 +234,22 @@ async def r_get_causal_weight(w: World) -> set[str]:
     return {nid for nid in w.all_ids if await w.graph.get_causal_weight(nid) > 0}
 
 
+async def r_list_space_nodes(w: World) -> set[str]:
+    seen: set[str] = set()
+    for sid in (A, B):
+        seen |= {str(n.id) for n in await w.graph.list_space_nodes(sid, limit=100, include_superseded=True)}
+    return seen
+
+
+async def r_space_tag_counts(w: World) -> set[str]:
+    # Counts carry no ids: non-empty counts for a space reveal all of its nodes.
+    seen: set[str] = set()
+    for sid, names in ((A, ("a1", "a2", "a3")), (B, ("b1", "b2", "b3"))):
+        if await w.graph.space_tag_counts(sid):
+            seen |= w.of(*names)
+    return seen
+
+
 # Every read method of GraphStorageProvider. Adding a read method means adding it here.
 READ_PATHS: dict[str, ReadCall] = {
     "get_node": r_get_node,
@@ -254,6 +270,8 @@ READ_PATHS: dict[str, ReadCall] = {
     "get_degree": r_get_degree,
     "get_supportive_degree": r_get_supportive_degree,
     "get_causal_weight": r_get_causal_weight,
+    "list_space_nodes": r_list_space_nodes,
+    "space_tag_counts": r_space_tag_counts,
 }
 
 

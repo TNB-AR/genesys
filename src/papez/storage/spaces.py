@@ -30,7 +30,7 @@ REGISTRY_FILE_VERSION = 1
 # Fields a caller may change through update_space. ``slug`` is immutable
 # (other systems may store it); ``archived_at`` is how archive/unarchive is done.
 _UPDATABLE_FIELDS = frozenset({
-    "name", "description", "forgetting_policy", "llm_inference_enabled", "archived_at",
+    "name", "description", "forgetting_policy", "llm_inference_enabled", "archived_at", "show_service_names",
 })
 
 _SLUG_RE = re.compile(SLUG_PATTERN)

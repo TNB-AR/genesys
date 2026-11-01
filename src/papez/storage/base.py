@@ -22,6 +22,8 @@ class GraphStorageProvider(Protocol):
     (``_get_org_ids``, ``_get_scope_space_ids``). A ``current_principal_type``
     of ``"service"`` means ``include_personal=False`` regardless of the flag.
     A ``space_ids`` argument of ``None`` means "use the context scope".
+    While ``current_embed`` is bound the scope is that one space, no personal
+    memory and no orgs, whatever the arguments or other variables say.
 
     Space nodes (``space_id`` set) live in the ``space::<space_id>`` bucket.
     ``create_edge`` raises ``ValueError("cross_space_edge")`` when the two
@@ -116,6 +118,23 @@ class GraphStorageProvider(Protocol):
         """Delete every node and edge of a space; return ``{"nodes": n, "edges": m}``.
 
         With ``dry_run=True`` count only and change nothing.
+        """
+        ...
+    async def list_space_nodes(
+        self, space_id: str, *, limit: int = 20, before: tuple[datetime, str] | None = None,
+        tags_any: list[str] | None = None, include_superseded: bool = False,
+    ) -> list[MemoryNode]:
+        """A space's nodes, newest first on ``(created_at desc, id desc)``.
+
+        ``before`` is an exclusive ``(created_at, id)`` keyset. Superseded nodes
+        are left out unless ``include_superseded``. A space outside the caller's
+        scope gives ``[]``.
+        """
+        ...
+    async def space_tag_counts(self, space_id: str, limit: int = 12) -> list[tuple[str, int]]:
+        """``(tag, count)`` over the space's non-superseded nodes, count desc then tag asc.
+
+        A space outside the caller's scope gives ``[]``.
         """
         ...
 

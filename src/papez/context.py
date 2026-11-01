@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextvars
+from typing import Any
 
 current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_user_id")
 current_org_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_org_id", default=None)
@@ -34,3 +35,10 @@ current_include_personal: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # Audit client descriptor: {"transport": "stdio"|"mcp"|"rest", "client_name": str | None}.
 # No default: readers call current_client.get({}).
 current_client: contextvars.ContextVar[dict[str, str | None]] = contextvars.ContextVar("current_client")
+
+# The embed token behind this request, when there is one (embeddable space
+# view). Shape: {"token_id", "space_id", "viewer": {"id", "email", "name"},
+# "permissions": [...]}. While it is bound, storage and the tool layer stay on
+# that one space whatever a caller's arguments say. A shared default of None is
+# safe here because the value is never mutated.
+current_embed: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("current_embed", default=None)

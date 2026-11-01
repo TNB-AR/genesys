@@ -239,6 +239,8 @@ class TestErasureToolHandler:
             handler = MCPToolHandler(graph=graph, embeddings=None, cache=cache)
             result = await handler.erase_user("other-user")
             assert "error" in result
+            assert "Only the user or an admin" in result["error"]
+            assert result["code"] == "insufficient_role"
         finally:
             current_user_id.reset(tok)
             current_org_ids.reset(tok_org)
@@ -349,7 +351,7 @@ class TestProviderEquivalence:
 
         import asyncpg
         import os
-        db_url = os.environ.get("DATABASE_URL", "postgresql://genesys:genesys@localhost:5432/genesys")
+        db_url = os.environ.get("DATABASE_URL") or "postgresql://genesys:genesys@localhost:5432/genesys"
         try:
             conn = await asyncpg.connect(db_url, timeout=3)
             await conn.close()
@@ -382,7 +384,7 @@ class TestProviderEquivalence:
 
         import asyncpg
         import os
-        db_url = os.environ.get("DATABASE_URL", "postgresql://genesys:genesys@localhost:5432/genesys")
+        db_url = os.environ.get("DATABASE_URL") or "postgresql://genesys:genesys@localhost:5432/genesys"
         try:
             conn = await asyncpg.connect(db_url, timeout=3)
             await conn.close()

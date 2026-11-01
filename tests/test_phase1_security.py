@@ -119,6 +119,7 @@ class TestPromoteToOrgAuthorization:
         result = await handler.promote_to_org(str(node.id), "org-2")
         assert "error" in result
         assert "org memberships" in result["error"]
+        assert result["code"] == "invalid_arguments"
 
     @pytest.mark.asyncio
     async def test_promote_to_org_rejects_non_owner(self, handler_with_graph):
@@ -162,6 +163,18 @@ class TestPromoteToOrgAuthorization:
         current_org_ids.reset(token_org_b2)
 
     @pytest.mark.asyncio
+    async def test_promote_to_org_non_owner_is_insufficient_role(self, handler_with_graph):
+        """A private node the caller can read but doesn't own: insufficient_role."""
+        handler, _ = handler_with_graph
+        node = _make_node(content_summary="someone else's", original_user_id="user-b")
+        graph = AsyncMock()
+        graph.get_node = AsyncMock(return_value=node)
+        handler.graph = graph
+        result = await handler.promote_to_org(str(node.id), "org-1")
+        assert "Only the node owner can promote to org" in result["error"]
+        assert result["code"] == "insufficient_role"
+
+    @pytest.mark.asyncio
     async def test_promote_to_org_succeeds_for_owner_in_org(self, handler_with_graph):
         """Node owner in the target org can promote."""
         handler, graph = handler_with_graph
@@ -189,6 +202,7 @@ class TestPromoteToOrgAuthorization:
         result = await handler.promote_to_org(str(node.id), "org-1")
         assert "error" in result
         assert "Already org-visible" in result["error"]
+        assert result["code"] == "invalid_arguments"
 
         current_user_id.reset(token_b)
         current_org_ids.reset(token_org_b)

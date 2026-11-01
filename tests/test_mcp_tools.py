@@ -170,6 +170,24 @@ class TestMemorySearch:
         assert result["results"][0]["status"] == "core"
 
     @pytest.mark.asyncio
+    async def test_search_status_filter_accepts_a_bare_string(self):
+        handler, graph, _, _ = _make_handler()
+        active = _make_node(status=MemoryStatus.ACTIVE)
+        graph.vector_search = AsyncMock(return_value=[(active, 0.8)])
+        graph.get_nodes_by_status = AsyncMock(return_value=[active])
+
+        result = await handler.memory_search("test", filters={"status": "active"}, k=5)
+        assert "error" not in result
+        assert graph.vector_search.await_args.kwargs["status_filter"] == [MemoryStatus.ACTIVE]
+        assert [r["status"] for r in result["results"]] == ["active"]
+
+        # enumeration mode (empty query) asks storage for that one status only
+        listed = await handler.memory_search("", filters={"status": "active"}, k=5)
+        assert "error" not in listed
+        graph.get_nodes_by_status.assert_awaited_once()
+        assert graph.get_nodes_by_status.await_args.args[0] == MemoryStatus.ACTIVE
+
+    @pytest.mark.asyncio
     async def test_search_with_category_filter(self):
         handler, graph, _, _ = _make_handler()
         node1 = _make_node(category="work")

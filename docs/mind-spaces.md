@@ -286,7 +286,7 @@ Every new error is `{"error": "<message>", "code": "<code>"}`. Existing errors k
 | `insufficient_role` | A member without the needed role, a service calling `space_create`, or a non-owner changing a personal memory |
 | `last_owner` | Removing or demoting the last user owner |
 | `slug_taken` | The slug is already used in that org |
-| `principal_not_in_org` | Adding a user from another org. The library has no org directory, so it checks this only when the host sets `MCPToolHandler.principal_in_org`; the hosted product does. |
+| `principal_not_in_org` | Adding a user or service principal from another org. The library has no org directory, so it checks this only when the host sets `MCPToolHandler.principal_in_org`; the hosted product does. |
 | `cross_space_edge` | An edge between different spaces, or between a space and personal memory |
 | `confirmation_mismatch` | `space_erase` with the wrong `confirm_slug` |
 | `external_id_exists` | `on_existing="error"` and the id exists |

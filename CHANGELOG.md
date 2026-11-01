@@ -49,6 +49,10 @@ Mind Spaces, references and tags, idempotent writes and an audit log. Additive: 
 - `memory_amend` creates its `SUPERSEDES` edge directly at weight 1.0.
 - `memory_search` over-fetches candidates (up to `k*4`, at most 400) when a post-query filter is set, so filtered searches still return up to `k` results.
 - `retryable` is also `true` for `space_list`, `space_get`, `space_member_list`, and for `memory_store_batch` when every item carries an `external_id` (decided per call).
+- `space_create` without a `slug` works on registries whose `slugs_for_org` is async (the hosted Postgres registry); it used to raise `TypeError`.
+- `space_member_add` asks the `MCPToolHandler.principal_in_org` hook for service principals as well as users; `False` returns `principal_not_in_org` and adds nothing. With no hook set (the library default) nothing changes.
+- `promote_to_org` errors gain codes, text unchanged: "Already org-visible" and "org_id not in caller's org memberships" are `invalid_arguments`, "Only the node owner can promote to org" is `insufficient_role`. `erase_user`'s "Only the user or an admin can erase user data" is `insufficient_role`.
+- `memory_search` accepts `filters={"status": "active"}` (a single string) as well as a list. A bare string used to be read character by character and raised `ValueError`.
 
 ### Docs
 

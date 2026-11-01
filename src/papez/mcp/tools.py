@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import uuid
@@ -292,8 +293,9 @@ class MCPToolHandler:
         self.spaces = spaces
         self.audit = audit
         # Optional org directory hook for space_member_add's principal_not_in_org
-        # check: ``async (org_id, principal_id) -> bool``. The library has no org
-        # directory, so when this is None the check is skipped (hosted sets it).
+        # check: ``async (org_id, principal_id) -> bool``, asked for users and
+        # services alike. The library has no org directory, so when this is None
+        # the check is skipped (hosted sets it).
         self.principal_in_org: Callable[[str, str], Any] | None = None
         self.preferences = CoreMemoryPreferences(cache)
 
@@ -1964,6 +1966,8 @@ class MCPToolHandler:
             return _error("invalid_arguments", "filters must be an object")
         if filters:
             filters = dict(filters)
+            if isinstance(filters.get("status"), str):
+                filters["status"] = [filters["status"]]
             try:
                 for key in ("tags_any", "tags_all"):
                     if filters.get(key) is not None:
@@ -2447,11 +2451,11 @@ class MCPToolHandler:
         if node.space_id is not None:
             return _error("invalid_arguments", "space memories can't be promoted to org", node_id=node_id)
         if node.visibility == Visibility.ORG:
-            return {"error": "Already org-visible", "node_id": node_id}
+            return _error("invalid_arguments", "Already org-visible", node_id=node_id)
         if org_id not in current_org_ids.get([]):
-            return {"error": "org_id not in caller's org memberships"}
+            return _error("invalid_arguments", "org_id not in caller's org memberships")
         if not _caller_owns_node(node):
-            return {"error": "Only the node owner can promote to org"}
+            return _error("insufficient_role", "Only the node owner can promote to org")
 
         # Check for cross-boundary edges (this node's edges to other private nodes)
         all_edges = await self.graph.get_edges(node_id, "both")
@@ -2546,7 +2550,7 @@ class MCPToolHandler:
             raise PermissionError("current_user_id not set — cannot erase")
         role = current_user_role.get(None)
         if uid != user_id and role != "admin":
-            return {"error": "Only the user or an admin can erase user data"}
+            return _error("insufficient_role", "Only the user or an admin can erase user data")
 
         manifest = await self.graph.erase_user(user_id, keep_promoted_nodes=keep_promoted_nodes)
         await self.cache.delete(f"core_preferences:{user_id}")
@@ -2695,7 +2699,9 @@ class MCPToolHandler:
         else:
             taken_fn = getattr(self.spaces, "slugs_for_org", None)
             if taken_fn is not None:
-                taken = set(taken_fn(org_id))
+                # Sync on InMemorySpaceRegistry, async on hosted registries.
+                raw = taken_fn(org_id)
+                taken = set(await raw if inspect.isawaitable(raw) else raw)
             else:
                 taken = {s.slug for s in await self.spaces.list_spaces_for_org(org_id, include_archived=True)}
             final_slug = unique_slug(name, taken)
@@ -2808,9 +2814,9 @@ class MCPToolHandler:
             return _error("invalid_arguments", "principal_type must be user|service and role owner|writer|reader")
         if ptype == PrincipalType.SERVICE and new_role == SpaceRole.OWNER:
             return _error("invalid_arguments", "A service principal can't be an owner")
-        if ptype == PrincipalType.USER and self.principal_in_org is not None:
+        if self.principal_in_org is not None:
             if not await self.principal_in_org(found.org_id, principal_id):
-                return _error("principal_not_in_org", "That user doesn't belong to the space's org")
+                return _error("principal_not_in_org", "That principal doesn't belong to the space's org")
         uid = _caller_uid() or ""
         existing = await self._get_member(found.id, principal_id)
         try:

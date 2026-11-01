@@ -137,6 +137,35 @@ async def test_space_create_slug_suffix_and_taken():
     assert bad["code"] == "invalid_arguments"
 
 
+class _AsyncSlugRegistry:
+    """Hosted-registry shape: wraps the in-memory registry, with slugs_for_org
+    and erased_at as coroutine functions (as on PostgresSpaceRegistry)."""
+
+    def __init__(self) -> None:
+        self.inner = InMemorySpaceRegistry()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    async def slugs_for_org(self, org_id: str) -> set[str]:
+        return self.inner.slugs_for_org(org_id)
+
+    async def erased_at(self, space_id: str) -> str | None:
+        return self.inner.erased_at(space_id)
+
+
+async def test_space_create_derives_slug_with_async_slugs_for_org():
+    """Hosted MCP space_create without a slug raised TypeError on an async slugs_for_org."""
+    h = MCPToolHandler(
+        graph=InMemoryGraphProvider(), embeddings=None, cache=InMemoryCacheProvider(),
+        spaces=_AsyncSlugRegistry(),
+    )
+    with principal("alice", orgs=[WORLD_ORG]):
+        first = await h.space_create("Name")
+        second = await h.space_create("Name")
+    assert [first["space"]["slug"], second["space"]["slug"]] == ["name", "name-2"]
+
+
 async def test_space_create_org_rules():
     h = await _bare_handler()
     with principal("alice", orgs=["org_1", "org_2"]):
@@ -232,6 +261,31 @@ async def test_member_add_principal_not_in_org_hook(space_world: SpaceWorld):
     res = await w.alice.call("space_member_add", w.a, "outsider", "user", "reader")
     assert res["code"] == "principal_not_in_org"
     assert (await w.alice.call("space_member_add", w.a, "insider", "user", "reader"))["created"] is True
+
+
+async def test_member_add_principal_in_org_hook_covers_services(space_world: SpaceWorld):
+    """The hook is asked for service principals too; False creates nothing."""
+    w = space_world
+    asked: list[tuple[str, str]] = []
+
+    async def in_org(org_id: str, principal_id: str) -> bool:
+        asked.append((org_id, principal_id))
+        return principal_id != "svc_outside"
+
+    w.handler.principal_in_org = in_org
+    res = await w.alice.call("space_member_add", w.a, "svc_outside", "service", "writer")
+    assert res["code"] == "principal_not_in_org"
+    assert all(m.principal_id != "svc_outside" for m in await w.registry.list_members(w.a))
+    ok = await w.alice.call("space_member_add", w.a, "svc_inside", "service", "reader")
+    assert ok["created"] is True
+    assert asked == [(WORLD_ORG, "svc_outside"), (WORLD_ORG, "svc_inside")]
+
+
+async def test_member_add_without_hook_adds_any_principal(space_world: SpaceWorld):
+    w = space_world
+    assert w.handler.principal_in_org is None
+    assert (await w.alice.call("space_member_add", w.a, "svc_new", "service", "reader"))["created"] is True
+    assert (await w.alice.call("space_member_add", w.a, "zed", "user", "reader"))["created"] is True
 
 
 async def test_member_remove_of_non_member_is_idempotent(space_world: SpaceWorld):

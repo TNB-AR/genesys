@@ -1,0 +1,60 @@
+{
+  "nodes": {
+    "6f1d2c3a-0b4e-4a5f-9c7d-1e2f3a4b5c6d": {
+      "id": "6f1d2c3a-0b4e-4a5f-9c7d-1e2f3a4b5c6d",
+      "status": "active",
+      "content_summary": "User prefers dark roast coffee",
+      "content_full": "User prefers dark roast coffee, brewed in a French press.",
+      "content_ref": null,
+      "embedding": null,
+      "created_at": "2025-03-01T10:00:00Z",
+      "last_accessed_at": "2025-03-02T10:00:00Z",
+      "last_reactivated_at": "2025-03-02T10:00:00Z",
+      "decay_score": 0.9,
+      "causal_weight": 1,
+      "reactivation_count": 1,
+      "reactivation_pattern": "single",
+      "irrelevance_counter": 0,
+      "source_agent": "claude",
+      "source_session": "s1",
+      "entity_refs": ["coffee"],
+      "category": "preference",
+      "pinned": false,
+      "promotion_reason": null,
+      "reactivation_timestamps": ["2025-03-02T10:00:00Z"]
+    },
+    "7a2e3d4b-1c5f-4b6a-8d8e-2f3a4b5c6d7e": {
+      "id": "7a2e3d4b-1c5f-4b6a-8d8e-2f3a4b5c6d7e",
+      "status": "episodic",
+      "content_summary": "User bought a French press in March",
+      "content_full": "User bought a French press in March because the drip machine broke.",
+      "content_ref": null,
+      "embedding": null,
+      "created_at": "2025-03-01T09:00:00Z",
+      "last_accessed_at": "2025-03-01T09:00:00Z",
+      "last_reactivated_at": "2025-03-01T09:00:00Z",
+      "decay_score": 0.7,
+      "causal_weight": 0,
+      "reactivation_count": 0,
+      "reactivation_pattern": "single",
+      "irrelevance_counter": 0,
+      "source_agent": "claude",
+      "source_session": "s1",
+      "entity_refs": [],
+      "category": null,
+      "pinned": false,
+      "promotion_reason": null,
+      "reactivation_timestamps": []
+    }
+  },
+  "edges": [
+    {
+      "id": "8b3f4e5c-2d6a-4c7b-9e9f-3a4b5c6d7e8f",
+      "source_id": "6f1d2c3a-0b4e-4a5f-9c7d-1e2f3a4b5c6d",
+      "target_id": "7a2e3d4b-1c5f-4b6a-8d8e-2f3a4b5c6d7e",
+      "type": "caused_by",
+      "weight": 0.7,
+      "created_at": "2025-03-01T10:00:00Z"
+    }
+  ]
+}

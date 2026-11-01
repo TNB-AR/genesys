@@ -1,0 +1,75 @@
+{
+  "legacy-user": {
+    "nodes": {
+      "9c4a5f6d-3e7b-4d8c-af0a-4b5c6d7e8f90": {
+        "id": "9c4a5f6d-3e7b-4d8c-af0a-4b5c6d7e8f90",
+        "status": "active",
+        "content_summary": "Team standup moved to 9:30",
+        "content_full": "The team standup moved to 9:30 starting next week.",
+        "content_ref": null,
+        "embedding": [0.6, 0.8, 0.0, 0.0],
+        "created_at": "2025-06-10T08:00:00Z",
+        "last_accessed_at": "2025-06-10T08:00:00Z",
+        "last_reactivated_at": "2025-06-10T08:00:00Z",
+        "decay_score": 1.0,
+        "causal_weight": 0,
+        "reactivation_count": 0,
+        "reactivation_pattern": "single",
+        "irrelevance_counter": 0,
+        "source_agent": "claude",
+        "source_session": "",
+        "entity_refs": [],
+        "category": "work",
+        "stability": 1.0,
+        "pinned": false,
+        "promotion_reason": null,
+        "reactivation_timestamps": [],
+        "org_id": null,
+        "visibility": "private",
+        "original_user_id": "legacy-user"
+      },
+      "ad5b6a7e-4f8c-4e9d-b01b-5c6d7e8f9001": {
+        "id": "ad5b6a7e-4f8c-4e9d-b01b-5c6d7e8f9001",
+        "status": "core",
+        "content_summary": "Org handbook lives in the wiki",
+        "content_full": "The org handbook lives in the internal wiki under /handbook.",
+        "content_ref": null,
+        "embedding": [0.0, 0.0, 0.6, 0.8],
+        "created_at": "2025-06-01T08:00:00Z",
+        "last_accessed_at": "2025-06-11T08:00:00Z",
+        "last_reactivated_at": "2025-06-11T08:00:00Z",
+        "decay_score": 1.0,
+        "causal_weight": 2,
+        "reactivation_count": 3,
+        "reactivation_pattern": "steady",
+        "irrelevance_counter": 0,
+        "source_agent": "claude",
+        "source_session": "s9",
+        "entity_refs": ["handbook"],
+        "category": "work",
+        "stability": 2.0,
+        "pinned": true,
+        "promotion_reason": "pinned",
+        "reactivation_timestamps": ["2025-06-11T08:00:00Z"],
+        "org_id": "org-legacy",
+        "visibility": "org",
+        "original_user_id": "legacy-user"
+      }
+    },
+    "edges": [
+      {
+        "id": "be6c7b8f-5a9d-4fae-b12c-6d7e8f900112",
+        "source_id": "9c4a5f6d-3e7b-4d8c-af0a-4b5c6d7e8f90",
+        "target_id": "ad5b6a7e-4f8c-4e9d-b01b-5c6d7e8f9001",
+        "type": "related_to",
+        "weight": 0.5,
+        "created_at": "2025-06-10T08:00:00Z",
+        "reason": null,
+        "created_by": "auto_link",
+        "source_context": null,
+        "last_validated_at": "2025-06-10T08:00:00Z",
+        "metadata": null
+      }
+    ]
+  }
+}

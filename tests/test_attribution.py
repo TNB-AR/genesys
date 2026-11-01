@@ -215,3 +215,23 @@ async def test_on_behalf_of_passed_through_call_tool_is_dropped(space_world: Spa
     await srv.call_tool("memory_store", {"content": "x", "space": w.a, "on_behalf_of": VIEWER})
     assert seen["content"] == "x"
     assert "on_behalf_of" not in seen
+
+
+@pytest.mark.parametrize("viewer", [
+    {"id": "a\x00b"},
+    {"id": "a\ud800"},
+    {"id": "x", "name": "a\x00b"},
+    {"id": "x", "name": "\udfff"},
+    {"id": "x", "email": "a\x00@b.co"},
+    {"id": "x", "email": "a\ud800@b.co"},
+    {"id": "x", "email": "a@b.co\n"},
+])
+def test_viewer_fields_storage_cannot_keep_are_refused(viewer):
+    with pytest.raises(ValidationFailure) as exc:
+        validate_viewer(viewer)
+    assert exc.value.code == "invalid_viewer"
+
+
+def test_other_control_characters_stay_data():
+    viewer = validate_viewer({"id": "a\r\nb", "name": "tab\there\x1b[31m"})
+    assert viewer["id"] == "a\r\nb" and viewer["name"] == "tab\there\x1b[31m"

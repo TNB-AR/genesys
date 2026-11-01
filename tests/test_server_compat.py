@@ -9,7 +9,6 @@ The last test drives a real ``python -m papez`` subprocess over stdio.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import inspect
 import json
 import os
@@ -28,7 +27,6 @@ _SERVER_ACCEPTS_WEBSITE_URL = "website_url" in inspect.signature(Server.__init__
 _SDK_VALIDATES_INPUT = srv.SDK_TOOL_API == "request_handlers" or (
     hasattr(Server, "call_tool") and "validate_input" in inspect.signature(Server.call_tool).parameters
 )
-_CAN_EMBED_LOCALLY = importlib.util.find_spec("sentence_transformers") is not None
 requires_input_validation = pytest.mark.skipif(
     not _SDK_VALIDATES_INPUT, reason="this mcp release's call_tool decorator does not validate inputSchema"
 )
@@ -221,26 +219,21 @@ class TestStdioRoundTrip:
                 assert created["space"]["slug"] == "round-trip"
                 assert created["space"]["org_id"] == srv.STDIO_LOCAL_ORG
                 assert created["space"]["your_role"] == "owner"
-                # With no OpenAI key the provider factory picks the local
-                # embedder, which needs sentence-transformers to embed at all
-                # (pre-existing; see providers._make_embedder). Store/recall
-                # only where an embedder can actually run.
-                if _CAN_EMBED_LOCALLY:
-                    stored = json.loads((await session.call_tool(
-                        "memory_store", {"content": "round trip space memory", "space": "round-trip", "tags": ["Trip"]},
-                    )).content[0].text)
-                    assert stored["status"] == "stored"
-                    assert stored["space"]["slug"] == "round-trip"
-                    listed_spaces = json.loads((await session.call_tool("space_list", {})).content[0].text)
-                    assert [s["memory_count"] for s in listed_spaces["spaces"]] == [1]
-                    recalled = json.loads((await session.call_tool(
-                        "memory_recall", {"query": "round trip", "space": "round-trip"},
-                    )).content[0].text)
-                    assert [r["id"] for r in recalled["results"]] == [stored["node_id"]]
-                    assert recalled["results"][0]["tags"] == ["trip"]
-                else:
-                    listed_spaces = json.loads((await session.call_tool("space_list", {})).content[0].text)
-                    assert [s["memory_count"] for s in listed_spaces["spaces"]] == [0]
+                # The provider factory falls back to keyword-only recall when
+                # no embedder can run (no OpenAI key, no sentence-transformers),
+                # so store/recall work over stdio on every machine.
+                stored = json.loads((await session.call_tool(
+                    "memory_store", {"content": "round trip space memory", "space": "round-trip", "tags": ["Trip"]},
+                )).content[0].text)
+                assert stored["status"] == "stored"
+                assert stored["space"]["slug"] == "round-trip"
+                listed_spaces = json.loads((await session.call_tool("space_list", {})).content[0].text)
+                assert [s["memory_count"] for s in listed_spaces["spaces"]] == [1]
+                recalled = json.loads((await session.call_tool(
+                    "memory_recall", {"query": "round trip", "space": "round-trip"},
+                )).content[0].text)
+                assert [r["id"] for r in recalled["results"]] == [stored["node_id"]]
+                assert recalled["results"][0]["tags"] == ["trip"]
                 missing = json.loads((await session.call_tool(
                     "memory_recall", {"query": "x", "space": "nope"},
                 )).content[0].text)

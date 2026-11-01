@@ -5,6 +5,7 @@ For production backends (Postgres, FalkorDB, etc.), use genesys-server.
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from dataclasses import dataclass
@@ -68,11 +69,7 @@ def _make_embedder() -> EmbeddingProvider | None:
     embedder = os.getenv("GENESYS_EMBEDDER", "openai")
 
     if embedder == "local":
-        try:
-            from papez.retrieval.embedding import LocalEmbeddingProvider
-            return LocalEmbeddingProvider()
-        except ImportError:
-            return None
+        return _local_embedder()
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if api_key:
@@ -85,6 +82,18 @@ def _make_embedder() -> EmbeddingProvider | None:
                 "falling back to the local embedder if available. Install it with: pip install 'papez[openai]'"
             )
 
+    return _local_embedder()
+
+
+def _local_embedder() -> EmbeddingProvider | None:
+    """LocalEmbeddingProvider only when sentence-transformers is importable.
+
+    The provider imports it lazily on the first embed(), so constructing it
+    without the package would make the first store/recall fail with
+    ModuleNotFoundError instead of falling back to keyword-only recall.
+    """
+    if importlib.util.find_spec("sentence_transformers") is None:
+        return None
     try:
         from papez.retrieval.embedding import LocalEmbeddingProvider
         return LocalEmbeddingProvider()
@@ -126,7 +135,7 @@ def get_providers() -> Providers:
 
     if llm_provider:
         from papez.engine.background import register_handlers
-        register_handlers(event_bus, graph, llm_provider, embeddings)
+        register_handlers(event_bus, graph, llm_provider, embeddings, spaces=spaces)
 
     tools = MCPToolHandler(
         graph=graph,
@@ -134,7 +143,8 @@ def get_providers() -> Providers:
         cache=cache,
         event_bus=event_bus,
         llm=llm_provider,
-        # TODO(WS-L5): pass spaces=spaces, audit=audit once MCPToolHandler accepts them.
+        spaces=spaces,
+        audit=audit,
     )
 
     _instance = Providers(

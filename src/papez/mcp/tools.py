@@ -2560,6 +2560,7 @@ class MCPToolHandler:
             # user owner (left in place and reported, so the space stays owned).
             still_owned: list[str] = []
             for space, _role in await self.spaces.list_spaces_for_principal(user_id, include_archived=True):
+                existing = await self._get_member(space.id, user_id)
                 try:
                     await self.spaces.remove_member(space.id, user_id)
                 except ValueError as exc:
@@ -2568,6 +2569,15 @@ class MCPToolHandler:
                         logger.warning("erase_user: %s is the last owner of space %s", user_id, space.id)
                     else:
                         raise
+                    continue
+                if existing is not None:
+                    # Membership changed in a space: spec 8.1 member.remove.
+                    await self._audit_event("member.remove", space.id, None, {
+                        "member_id": user_id,
+                        "member_type": _role_value(existing.principal_type),
+                        "role": _role_value(existing.role),
+                        "via": "erase_user",
+                    })
             result["spaces_still_owned"] = still_owned
         await self._notify("user.erased", {"user_id": user_id, "manifest": manifest})
         return result

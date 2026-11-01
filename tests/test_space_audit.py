@@ -546,3 +546,30 @@ async def test_stdio_call_tool_records_client(monkeypatch, name):
     assert audit.events[0]["action"] == "space.create"
     assert audit.events[1]["action"] == name.replace("_", ".")
     assert audit.events[1]["principal_id"] == srv.STDIO_LOCAL_USER
+
+
+async def test_erase_user_membership_removal_is_audited(space_world):
+    """WS-verify: erase_user drops memberships; each drop is a spec 8.1 member.remove.
+
+    The space where the user is the last user owner keeps the membership
+    (spaces_still_owned) and logs nothing.
+    """
+    world = space_world
+    await _add(world, world.a, "dave", SpaceRole.OWNER)
+    await _add(world, world.b, "alice", SpaceRole.READER)
+    owned = await world.alice.call("space_create", "Alice Only", slug="alice-only")
+    _clear(world)
+
+    result = await world.alice.call("erase_user", "alice")
+
+    assert result["spaces_still_owned"] == [owned["space"]["id"]]
+    removes = sorted(
+        ((e["space_id"], e["detail"]["role"]) for e in world.audit.events if e["action"] == "member.remove"),
+    )
+    assert removes == sorted([(world.a, "owner"), (world.b, "reader")])
+    for e in world.audit.events:
+        assert set(e) == EVENT_KEYS
+        assert e["detail"]["member_id"] == "alice"
+        assert e["detail"]["member_type"] == "user"
+        assert e["detail"]["via"] == "erase_user"
+    assert owned["space"]["id"] not in {e["space_id"] for e in world.audit.events}

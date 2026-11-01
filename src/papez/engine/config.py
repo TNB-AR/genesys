@@ -306,3 +306,14 @@ DORMANT_REVIVAL_THRESHOLD = _float("GENESYS_DORMANT_REVIVAL_THRESHOLD", "0.1")
 # Ingestion Limits
 # ---------------------------------------------------------------------------
 MAX_INGEST_FILE_MB = _int("GENESYS_MAX_INGEST_FILE_MB", "100")
+
+# ---------------------------------------------------------------------------
+# References, tags, spaces, audit and batch writes (tools.py, storage/audit.py)
+# Read as config.X at call time; models/ref.py takes these as explicit args.
+# ---------------------------------------------------------------------------
+MAX_REFS_PER_MEMORY = _int("GENESYS_MAX_REFS_PER_MEMORY", "20")
+MAX_TAGS_PER_MEMORY = _int("GENESYS_MAX_TAGS_PER_MEMORY", "20")
+MAX_TAG_LENGTH = _int("GENESYS_MAX_TAG_LENGTH", "50")
+AUDIT_MAX_EVENTS = _int("GENESYS_AUDIT_MAX_EVENTS", "100000")
+BATCH_MAX_ITEMS = _int("GENESYS_BATCH_MAX_ITEMS", "100")
+AUDIT_READ_NODE_IDS_CAP = _int("GENESYS_AUDIT_READ_NODE_IDS_CAP", "50")

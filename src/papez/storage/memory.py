@@ -505,7 +505,10 @@ class InMemoryGraphProvider:
 
     # -- Graph queries (indexed) ------------------------------------------------
 
-    async def traverse(self, start_id: str, depth: int, edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None) -> list[MemoryNode]:
+    async def traverse(
+        self, start_id: str, depth: int, edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None,  # WS-L1 stub: accepted, ignored (WS-L2 implements)
+    ) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
         visible_ids = set(visible.keys())
         visited: set[str] = set()
@@ -531,6 +534,7 @@ class InMemoryGraphProvider:
 
     async def get_connecting_edges(
         self, node_ids: list[str], edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None,  # WS-L1 stub: accepted, ignored (WS-L2 implements)
     ) -> list[MemoryEdge]:
         """Return visible edges of the induced subgraph among ``node_ids``.
 
@@ -561,7 +565,10 @@ class InMemoryGraphProvider:
                 seen.add(eid)
         return result
 
-    async def get_causal_chain(self, node_id: str, direction: str, org_ids: list[str] | None = None) -> list[MemoryNode]:
+    async def get_causal_chain(
+        self, node_id: str, direction: str, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None,  # WS-L1 stub: accepted, ignored (WS-L2 implements)
+    ) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
         visible_ids = set(visible.keys())
         visited: set[str] = set()
@@ -590,6 +597,7 @@ class InMemoryGraphProvider:
 
     async def get_causal_chains_batch(
         self, node_ids: list[str], direction: str, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None,  # WS-L1 stub: accepted, ignored (WS-L2 implements)
     ) -> dict[str, list[MemoryNode]]:
         """BFS from all seed nodes simultaneously, sharing one visibility scan."""
         visible = self._visible_nodes(org_ids)
@@ -654,6 +662,8 @@ class InMemoryGraphProvider:
 
     async def vector_search(
         self, embedding: list[float], k: int = 10, status_filter: list[MemoryStatus] | None = None, org_ids: list[str] | None = None,
+        # WS-L1 stub: the three params below are accepted and ignored (WS-L2 implements)
+        space_ids: list[str] | None = None, tags_any: list[str] | None = None, ref_type: str | None = None,
     ) -> list[tuple[MemoryNode, float]]:
         import numpy as np
 
@@ -683,7 +693,11 @@ class InMemoryGraphProvider:
 
         return [(nodes_with_emb[i], float(sims[i])) for i in top_indices]
 
-    async def keyword_search(self, query: str, entity_refs: list[str] | None = None, k: int = 10, org_ids: list[str] | None = None) -> list[MemoryNode]:
+    async def keyword_search(
+        self, query: str, entity_refs: list[str] | None = None, k: int = 10, org_ids: list[str] | None = None,
+        # WS-L1 stub: the three params below are accepted and ignored (WS-L2 implements)
+        space_ids: list[str] | None = None, tags_any: list[str] | None = None, ref_type: str | None = None,
+    ) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
         query_terms = _tokenize(query)
         if not query_terms:
@@ -704,6 +718,22 @@ class InMemoryGraphProvider:
                 scored.append((node, total / len(query_terms)))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [node for node, _ in scored[:k]]
+
+    # -- References, idempotent writes and spaces (WS-L1 stubs; WS-L2 replaces) --
+
+    async def find_nodes_by_ref(
+        self, ref_type: str, ref_id: str, org_ids: list[str] | None = None, space_ids: list[str] | None = None,
+    ) -> list[MemoryNode]:
+        return []
+
+    async def find_node_by_external_id(self, external_id: str, space_id: str | None) -> MemoryNode | None:
+        return None
+
+    async def space_bucket_ids(self) -> list[str]:
+        return []
+
+    async def erase_space(self, space_id: str, dry_run: bool = False) -> dict[str, int]:
+        return {"nodes": 0, "edges": 0}
 
     # -- Misc -------------------------------------------------------------------
 

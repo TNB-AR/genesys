@@ -5,11 +5,36 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from papez.models.edge import MemoryEdge
-from papez.models.enums import EdgeType, MemoryStatus
+from papez.models.enums import EdgeType, MemoryStatus, SpaceRole
 from papez.models.node import MemoryNode
+from papez.models.space import Space, SpaceMember
 
 
 class GraphStorageProvider(Protocol):
+    """Graph storage for memory nodes and edges.
+
+    Visibility (spec 6.5, D01): every read returns, links, compares or counts
+    only nodes visible to the caller. Scope comes from the explicit
+    ``org_ids``/``space_ids`` arguments where a method takes them, otherwise
+    from the context variables (``current_user_id``, ``current_org_ids``,
+    ``current_scope_space_ids``, ``current_include_personal``,
+    ``current_principal_type``); the fallbacks live in storage
+    (``_get_org_ids``, ``_get_scope_space_ids``). A ``current_principal_type``
+    of ``"service"`` means ``include_personal=False`` regardless of the flag.
+    A ``space_ids`` argument of ``None`` means "use the context scope".
+
+    Space nodes (``space_id`` set) live in the ``space::<space_id>`` bucket.
+    ``create_edge`` raises ``ValueError("cross_space_edge")`` when the two
+    endpoints are in different spaces (or one is a space node and the other is
+    personal/org/missing). ``erase_user`` returns the four existing keys plus
+    ``space_nodes_anonymized``.
+
+    Optional: a provider may define ``atomic()``, an async context manager that
+    makes the writes inside it all-or-nothing (in-memory: wraps
+    ``defer_saves``; Postgres: a transaction). It is not part of the protocol;
+    callers detect it with ``hasattr(graph, "atomic")``, like ``defer_saves``.
+    """
+
     async def initialize(self, user_id: str) -> None: ...
     async def destroy(self, user_id: str) -> None: ...
 
@@ -27,23 +52,72 @@ class GraphStorageProvider(Protocol):
     async def get_all_edges(self, node_ids: list[str] | None = None) -> list[MemoryEdge]: ...
     async def edge_exists(self, source_id: str, target_id: str, edge_type: EdgeType) -> bool: ...
 
-    async def traverse(self, start_id: str, depth: int, edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None) -> list[MemoryNode]: ...
-    async def get_connecting_edges(self, node_ids: list[str], edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None) -> list[MemoryEdge]: ...
-    async def get_causal_chain(self, node_id: str, direction: str, org_ids: list[str] | None = None) -> list[MemoryNode]: ...
-    async def get_causal_chains_batch(self, node_ids: list[str], direction: str, org_ids: list[str] | None = None) -> dict[str, list[MemoryNode]]: ...
+    async def traverse(
+        self, start_id: str, depth: int, edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None,
+    ) -> list[MemoryNode]: ...
+    async def get_connecting_edges(
+        self, node_ids: list[str], edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None,
+    ) -> list[MemoryEdge]: ...
+    async def get_causal_chain(
+        self, node_id: str, direction: str, org_ids: list[str] | None = None, space_ids: list[str] | None = None,
+    ) -> list[MemoryNode]: ...
+    async def get_causal_chains_batch(
+        self, node_ids: list[str], direction: str, org_ids: list[str] | None = None, space_ids: list[str] | None = None,
+    ) -> dict[str, list[MemoryNode]]: ...
     async def get_causal_weight(self, node_id: str) -> int: ...
     async def get_degree(self, node_id: str) -> int: ...
     async def get_supportive_degree(self, node_id: str) -> int: ...
     async def is_orphan(self, node_id: str) -> bool: ...
     async def get_orphans(self) -> list[MemoryNode]: ...
 
-    async def vector_search(self, embedding: list[float], k: int = 10, status_filter: list[MemoryStatus] | None = None, org_ids: list[str] | None = None) -> list[tuple[MemoryNode, float]]: ...
-    async def keyword_search(self, query: str, entity_refs: list[str] | None = None, k: int = 10, org_ids: list[str] | None = None) -> list[MemoryNode]: ...
+    async def vector_search(
+        self, embedding: list[float], k: int = 10, status_filter: list[MemoryStatus] | None = None,
+        org_ids: list[str] | None = None, space_ids: list[str] | None = None,
+        tags_any: list[str] | None = None, ref_type: str | None = None,
+    ) -> list[tuple[MemoryNode, float]]:
+        """Top-``k`` visible nodes by cosine similarity.
+
+        ``tags_any`` (node has at least one of the tags) and ``ref_type`` (node
+        has a ref of that type) are applied BEFORE the top-``k`` cut, so ``k``
+        filtered results come back when that many exist.
+        """
+        ...
+    async def keyword_search(
+        self, query: str, entity_refs: list[str] | None = None, k: int = 10, org_ids: list[str] | None = None,
+        space_ids: list[str] | None = None, tags_any: list[str] | None = None, ref_type: str | None = None,
+    ) -> list[MemoryNode]:
+        """Top-``k`` visible keyword matches; ``tags_any``/``ref_type`` filter before the cut."""
+        ...
     async def get_stats(self) -> dict[str, Any]: ...
 
     async def promote_to_org(self, node_id: str, org_id: str) -> None: ...
     async def atomic_reactivation_update(self, node_id: str, timestamp: datetime, stability_delta: float) -> None: ...
     async def erase_user(self, user_id: str, keep_promoted_nodes: bool = True) -> dict[str, int]: ...
+
+    # -- References, idempotent writes and spaces ------------------------------
+    async def find_nodes_by_ref(
+        self, ref_type: str, ref_id: str, org_ids: list[str] | None = None, space_ids: list[str] | None = None,
+    ) -> list[MemoryNode]:
+        """Visible nodes carrying a ref with exactly this ``(type, id)``."""
+        ...
+    async def find_node_by_external_id(self, external_id: str, space_id: str | None) -> MemoryNode | None:
+        """The current (non-superseded) node with this ``external_id``.
+
+        Looks in the ``space::<space_id>`` bucket, or in the caller's personal
+        bucket when ``space_id`` is ``None``. Returns ``None`` when absent.
+        """
+        ...
+    async def space_bucket_ids(self) -> list[str]:
+        """Space ids that currently have a bucket (for maintenance passes)."""
+        ...
+    async def erase_space(self, space_id: str, dry_run: bool = False) -> dict[str, int]:
+        """Delete every node and edge of a space; return ``{"nodes": n, "edges": m}``.
+
+        With ``dry_run=True`` count only and change nothing.
+        """
+        ...
 
 
 class EmbeddingProvider(Protocol):
@@ -73,3 +147,42 @@ class LLMProvider(Protocol):
 class EventBusProvider(Protocol):
     async def publish(self, channel: str, payload: dict[str, Any]) -> None: ...
     async def subscribe(self, channel: str, handler: Callable[..., Any]) -> None: ...
+
+
+class SpaceRegistry(Protocol):
+    """Spaces and memberships (spec 7.5 plus the 3a additions).
+
+    Errors are raised as ``ValueError`` whose message is the spec code
+    (``"slug_taken"``, ``"last_owner"``); the tool layer translates them into
+    ``{"error", "code"}`` dicts. ``roles_for_principal`` and
+    ``list_spaces_for_principal`` exclude archived spaces unless
+    ``include_archived=True``; erased spaces are never returned.
+    """
+
+    async def initialize(self) -> None: ...
+    async def create_space(self, space: Space) -> Space: ...
+    async def get_space(self, space_id: str) -> Space | None: ...
+    async def get_space_by_slug(self, org_id: str, slug: str) -> Space | None: ...
+    async def list_spaces_for_principal(
+        self, principal_id: str, include_archived: bool = False,
+    ) -> list[tuple[Space, SpaceRole]]: ...
+    async def list_spaces_for_org(self, org_id: str, include_archived: bool = False) -> list[Space]: ...
+    async def update_space(self, space_id: str, updates: dict[str, Any]) -> Space: ...
+    async def mark_erased(self, space_id: str) -> None: ...
+    async def add_member(self, member: SpaceMember) -> SpaceMember: ...
+    async def remove_member(self, space_id: str, principal_id: str) -> None: ...
+    async def list_members(self, space_id: str) -> list[SpaceMember]: ...
+    async def count_members(self, space_id: str) -> int: ...
+    async def roles_for_principal(self, principal_id: str, include_archived: bool = False) -> dict[str, SpaceRole]: ...
+
+
+class AuditSink(Protocol):
+    """Append-only audit event sink (spec 8.2, 8.3).
+
+    ``event`` has the spec 8.2 shape: ``id`` (``f"evt_{uuid4().hex}"``), ``at``
+    (ISO-8601 UTC with milliseconds and ``Z``), ``space_id``, ``principal_id``,
+    ``principal_type``, ``action``, ``node_ids``, ``detail``, ``client``. Never
+    memory content or raw query text.
+    """
+
+    async def record(self, event: dict[str, Any]) -> None: ...

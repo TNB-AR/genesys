@@ -326,16 +326,21 @@ class MCPToolHandler:
         node_ids: list[str] | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
-        """Record one audit event (spec 8.2). No-op when no sink is configured.
+        """Record one audit event (spec 8.1, 8.2, D18). No-op without a sink.
 
-        WS-L7 wires the call sites. Never pass memory content or query text:
-        ids, counts and lengths only.
+        Never pass memory content, summaries, slugs or query text: ids,
+        counts and lengths only. ``node_ids`` is capped at
+        ``config.AUDIT_READ_NODE_IDS_CAP``. A failing sink is logged, never
+        raised, so auditing can't break a tool call.
         """
         if self.audit is None:
             return
         from papez.engine import config
+        from papez.storage.audit import audit_timestamp, new_event_id
 
         event: dict[str, Any] = {
+            "id": new_event_id(),
+            "at": audit_timestamp(),
             "space_id": space_id,
             "principal_id": _caller_uid(),
             "principal_type": current_principal_type.get(PrincipalType.USER.value),
@@ -348,6 +353,77 @@ class MCPToolHandler:
             await self.audit.record(event)
         except Exception:
             logger.warning("audit record failed for %s on %s", action, space_id, exc_info=True)
+
+    async def _audit_denied(self, space_id: str, code: str, need: SpaceRole | None) -> None:
+        """``access.denied`` against a real space (spec 8.1)."""
+        await self._audit_event(
+            "access.denied", space_id, None,
+            {"code": code, "need_role": need.value if need is not None else None},
+        )
+
+    async def _audit_denied_ref(self, ref: str, need: SpaceRole | None) -> None:
+        """``access.denied`` for a ``space_not_found`` answer, if ``ref`` names a real space.
+
+        The caller was told "not found"; the event is logged against the real
+        space id (an id anywhere, or a slug in one of the caller's orgs). A
+        ref that matches no live space logs nothing.
+        """
+        if self.audit is None or self.spaces is None or not isinstance(ref, str) or not ref:
+            return
+        try:
+            found = await self.spaces.get_space(ref)
+            if found is None:
+                for org_id in current_org_ids.get([]):
+                    found = await self.spaces.get_space_by_slug(org_id, ref)
+                    if found is not None:
+                        break
+        except Exception:
+            logger.warning("could not resolve space for access.denied", exc_info=True)
+            return
+        if found is not None:
+            await self._audit_denied(found.id, "space_not_found", need)
+
+    async def _audit_reads(
+        self,
+        action: str,
+        space_ids: list[str],
+        hits: list[tuple[str, str | None]],
+        query_chars: int,
+    ) -> None:
+        """One read event per space in scope, counting that space's results (spec 8.1).
+
+        ``hits`` is ``(node_id, space_id)`` for every returned result; personal
+        hits (``space_id`` None) are never audited.
+        """
+        if self.audit is None:
+            return
+        for sid in dict.fromkeys(space_ids):
+            ids = [nid for nid, hit_space in hits if hit_space == sid]
+            await self._audit_event(action, sid, ids, {"query_chars": query_chars, "results": len(ids)})
+
+    @staticmethod
+    def _hits_of(results: Any) -> list[tuple[str, str | None]]:
+        """``(id, space id)`` pairs from recall/search result rows."""
+        out: list[tuple[str, str | None]] = []
+        for row in results if isinstance(results, list) else []:
+            if not isinstance(row, dict) or row.get("id") is None:
+                continue
+            label = row.get("space")
+            out.append((str(row["id"]), label.get("id") if isinstance(label, dict) else None))
+        return out
+
+    async def _audit_write_result(
+        self, space_id: str | None, result: dict[str, Any], extra: dict[str, Any] | None = None,
+    ) -> None:
+        """``memory.store`` / ``memory.amend`` for one space write (store, batch item)."""
+        if space_id is None or "error" in result or "node_id" not in result:
+            return
+        status = result.get("status")
+        detail: dict[str, Any] = {"status": status, **(extra or {})}
+        if status == "amended" and result.get("superseded"):
+            await self._audit_event("memory.amend", space_id, [result["node_id"], result["superseded"]], detail)
+        else:
+            await self._audit_event("memory.store", space_id, [result["node_id"]], detail)
 
     # -- scope and authorization (D06, D07) -------------------------------------
 
@@ -436,12 +512,15 @@ class MCPToolHandler:
                     return _Scope(error=_space_not_found())
                 hit = await self._lookup_space(ref, roles)
                 if hit is None:
+                    await self._audit_denied_ref(ref, need)
                     return _Scope(error=_space_not_found())
                 found, role = hit
                 sid = found.id if found is not None else ref
                 if found is not None and found.archived and not allow_archived:
+                    await self._audit_denied(sid, "space_archived", need)
                     return _Scope(error=_error("space_archived", "This space is archived and read-only"))
                 if need is not None and SPACE_ROLE_RANK[SpaceRole(role)] < SPACE_ROLE_RANK[need]:
+                    await self._audit_denied(sid, "insufficient_role", need)
                     return _Scope(error=_error(
                         "insufficient_role", f"This action needs the {need.value} role in the space",
                     ))
@@ -527,8 +606,10 @@ class MCPToolHandler:
         if role is None:
             return _not_found(str(node.id))
         if space is not None and space.archived:
+            await self._audit_denied(sid, "space_archived", SpaceRole.WRITER)
             return _error("space_archived", "This space is archived and read-only")
         if SPACE_ROLE_RANK[SpaceRole(role)] < SPACE_ROLE_RANK[SpaceRole.WRITER]:
+            await self._audit_denied(sid, "insufficient_role", SpaceRole.WRITER)
             return _error("insufficient_role", "This action needs the writer role in the space")
         return None
 
@@ -633,6 +714,7 @@ class MCPToolHandler:
             else:
                 result = await self._write_memory(validated)
             if space_id is not None and "error" not in result:
+                await self._audit_write_result(space_id, result)
                 result["space"] = self._space_label(space_id, scope.spaces)
             return result
         finally:
@@ -986,6 +1068,8 @@ class MCPToolHandler:
                 return result
             new_id = result["node_id"]
             await self._notify("memory.amended", {"node_id": new_id, "supersedes": node_id})
+            if old.space_id is not None:
+                await self._audit_event("memory.amend", old.space_id, [new_id, node_id], {"status": "amended"})
             return {"node_id": new_id, "supersedes": node_id, "status": "amended"}
         finally:
             scope.reset()
@@ -1085,6 +1169,7 @@ class MCPToolHandler:
                 return _error("batch_invalid", f"{len(problems)} {noun} invalid", items=problems)
 
             results: list[dict[str, Any]] = []
+            failure: dict[str, Any] | None = None
             async with self._atomic():
                 for index, (v, index_links) in enumerate(plans):
                     for ref_index, etype in index_links:
@@ -1104,18 +1189,24 @@ class MCPToolHandler:
                     if "error" in written:
                         # Validation ran first, so this is not expected; stop
                         # rather than continue on a half-applied batch.
-                        return _error(
+                        failure = _error(
                             written.get("code", "invalid_arguments"),
                             f"item {index} failed after validation: {written.get('error')}",
                             index=index,
                             results=results,
                         )
+                        break
                     row: dict[str, Any] = {
                         "index": index, "node_id": written["node_id"], "status": written["status"],
                     }
                     if "superseded" in written:
                         row["superseded"] = written["superseded"]
                     results.append(row)
+            # Audit after the atomic block: one event per written item.
+            for row in results:
+                await self._audit_write_result(space_id, row, {"batch_index": row["index"]})
+            if failure is not None:
+                return failure
             return {"results": results}
         finally:
             scope.reset()
@@ -1228,6 +1319,7 @@ class MCPToolHandler:
         try:
             space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
             counts = {"retired": 0, "updated": 0, "deleted": 0}
+            audit_rows: list[tuple[str, list[str]]] = []
             nodes = await self.graph.find_nodes_by_ref(ref_type, ref_id)
             async with self._atomic():
                 for node in nodes:
@@ -1254,10 +1346,12 @@ class MCPToolHandler:
                         if "error" in result:
                             return result
                         await self._notify("memory.amended", {"node_id": result["node_id"], "supersedes": nid})
+                        audit_rows.append(("memory.amend", [result["node_id"], nid]))
                         counts["updated"] += 1
                     elif mode == "delete":
                         await self.graph.delete_node(nid)
                         await self._notify("memory.deleted", {"node_id": nid})
+                        audit_rows.append(("memory.delete", [nid]))
                         counts["deleted"] += 1
                     else:
                         if "retired" in node.tags:
@@ -1272,7 +1366,11 @@ class MCPToolHandler:
                         if "error" in result:
                             return result
                         await self._notify("memory.amended", {"node_id": result["node_id"], "supersedes": nid})
+                        audit_rows.append(("memory.amend", [result["node_id"], nid]))
                         counts["retired"] += 1
+            if space_id is not None:
+                for action, ids in audit_rows:
+                    await self._audit_event(action, space_id, ids, {"via": "retire_by_ref", "mode": mode})
             return counts
         finally:
             scope.reset()
@@ -1313,10 +1411,16 @@ class MCPToolHandler:
         if scope.error is not None:
             return scope.error
         try:
-            return await self._recall(
+            out = await self._recall(
                 query, k, max_results, read_only, verbosity, min_results,
                 tags_any=norm_tags or None, ref_type=ref_type or None, labels=scope.spaces,
             )
+            if "error" not in out:
+                await self._audit_reads(
+                    "memory.recall", scope.space_ids, self._hits_of(out.get("results")),
+                    len(query) if isinstance(query, str) else 0,
+                )
+            return out
         finally:
             scope.reset()
 
@@ -1873,7 +1977,13 @@ class MCPToolHandler:
         if scope.error is not None:
             return scope.error
         try:
-            return await self._search(query, filters, k, scope.spaces)
+            out = await self._search(query, filters, k, scope.spaces)
+            if "error" not in out:
+                await self._audit_reads(
+                    "memory.search", scope.space_ids, self._hits_of(out.get("results")),
+                    len(query) if isinstance(query, str) else 0,
+                )
+            return out
         finally:
             scope.reset()
 
@@ -1972,9 +2082,18 @@ class MCPToolHandler:
         if scope.error is not None:
             return scope.error
         try:
-            if await self.graph.get_node(node_id) is None:
+            start = await self.graph.get_node(node_id)
+            if start is None:
                 return _not_found(node_id)
-            return await self._traverse(node_id, depth, edge_types)
+            space_of: dict[str, str | None] = {}
+            out = await self._traverse(node_id, depth, edge_types, space_of=space_of)
+            if start.space_id is not None and "error" not in out:
+                # Edges never cross a space boundary, so a traversal reads
+                # exactly one space: the start node's (personal starts: none).
+                await self._audit_reads(
+                    "memory.traverse", [start.space_id], list(space_of.items()), 0,
+                )
+            return out
         finally:
             scope.reset()
 
@@ -1983,6 +2102,8 @@ class MCPToolHandler:
         node_id: str,
         depth: int = 2,
         edge_types: list[str] | None = None,
+        *,
+        space_of: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         MAX_DEPTH = 10
         if depth > MAX_DEPTH:
@@ -2014,6 +2135,8 @@ class MCPToolHandler:
             }
             for n in nodes
         ]
+        if space_of is not None:
+            space_of.update({str(n.id): n.space_id for n in nodes})
 
         # Edges of the induced subgraph among the returned nodes (a deliberate
         # superset of the BFS tree, so callers can render/reconstruct paths).
@@ -2058,7 +2181,11 @@ class MCPToolHandler:
         """
         scope = await self._node_scope(include_archived=False)
         try:
-            return await self._explain(node_id, scope.spaces)
+            out = await self._explain(node_id, scope.spaces)
+            label = out.get("space") if "error" not in out else None
+            if isinstance(label, dict) and label.get("id"):
+                await self._audit_reads("memory.explain", [label["id"]], [(node_id, label["id"])], 0)
+            return out
         finally:
             scope.reset()
 
@@ -2174,6 +2301,8 @@ class MCPToolHandler:
                 "promotion_reason": "user_pinned",
             })
             await self._notify("memory.pinned", {"node_id": node_id})
+            if node.space_id is not None:
+                await self._audit_event("memory.pin", node.space_id, [node_id], {})
             return {"node_id": node_id, "status": "pinned", "new_status": "core"}
         finally:
             scope.reset()
@@ -2190,6 +2319,8 @@ class MCPToolHandler:
                 return denied
 
             await self.graph.update_node(node_id, {"pinned": False})
+            if node.space_id is not None:
+                await self._audit_event("memory.unpin", node.space_id, [node_id], {})
 
             # Re-evaluate: refresh node after unpin, inside the node's own scope
             # so core promotion counts only that scope's edges.
@@ -2258,6 +2389,8 @@ class MCPToolHandler:
 
             await self.graph.delete_node(node_id)
             await self._notify("memory.deleted", {"node_id": node_id})
+            if node.space_id is not None:
+                await self._audit_event("memory.delete", node.space_id, [node_id], {})
             return {"node_id": node_id, "status": "deleted"}
         finally:
             scope.reset()
@@ -2582,6 +2715,7 @@ class MCPToolHandler:
             if str(exc) == "slug_taken":
                 return _error("slug_taken", "That slug is already used in this org")
             return _error("invalid_arguments", "invalid space")
+        await self._audit_event("space.create", created.id, None, {"org_id": created.org_id})
         return {"space": self._space_dict(created, SpaceRole.OWNER)}
 
     async def space_list(self, include_archived: bool = False) -> dict[str, Any]:
@@ -2642,6 +2776,8 @@ class MCPToolHandler:
             updated = await self.spaces.update_space(found.id, updates)
         except ValueError:
             return _error("invalid_arguments", "invalid space update")
+        # Field names only: names and descriptions are content, never audited.
+        await self._audit_event("space.update", found.id, None, {"fields": sorted(updates)})
         return {"space": self._space_dict(updated, role)}
 
     async def space_member_add(
@@ -2666,12 +2802,7 @@ class MCPToolHandler:
             if not await self.principal_in_org(found.org_id, principal_id):
                 return _error("principal_not_in_org", "That user doesn't belong to the space's org")
         uid = _caller_uid() or ""
-        existing = None
-        getter = getattr(self.spaces, "get_member", None)
-        if getter is not None:
-            existing = await getter(found.id, principal_id)
-        else:
-            existing = next((m for m in await self.spaces.list_members(found.id) if m.principal_id == principal_id), None)
+        existing = await self._get_member(found.id, principal_id)
         try:
             member = await self.spaces.add_member(SpaceMember(
                 space_id=found.id,
@@ -2684,7 +2815,23 @@ class MCPToolHandler:
             if str(exc) == "last_owner":
                 return _error("last_owner", "A space must keep at least one user owner")
             return _error("invalid_arguments", "invalid member")
+        detail: dict[str, Any] = {
+            "member_id": principal_id, "member_type": ptype.value, "role": new_role.value,
+        }
+        if existing is None:
+            await self._audit_event("member.add", found.id, None, detail)
+        else:
+            detail["previous_role"] = _role_value(existing.role)
+            await self._audit_event("member.role_change", found.id, None, detail)
         return {"member": self._member_dict(member), "created": existing is None}
+
+    async def _get_member(self, space_id: str, principal_id: str) -> SpaceMember | None:
+        assert self.spaces is not None
+        getter = getattr(self.spaces, "get_member", None)
+        if getter is not None:
+            member: SpaceMember | None = await getter(space_id, principal_id)
+            return member
+        return next((m for m in await self.spaces.list_members(space_id) if m.principal_id == principal_id), None)
 
     async def space_member_remove(self, space: str, principal_id: str) -> dict[str, Any]:
         """Remove a member (owner). Takes effect on their next request."""
@@ -2693,12 +2840,19 @@ class MCPToolHandler:
             return hit
         found, _ = hit
         assert self.spaces is not None
+        existing = await self._get_member(found.id, principal_id) if isinstance(principal_id, str) else None
         try:
             await self.spaces.remove_member(found.id, principal_id)
         except ValueError as exc:
             if str(exc) == "last_owner":
                 return _error("last_owner", "A space must keep at least one user owner")
             return _space_not_found()
+        if existing is not None:
+            await self._audit_event("member.remove", found.id, None, {
+                "member_id": principal_id,
+                "member_type": _role_value(existing.principal_type),
+                "role": _role_value(existing.role),
+            })
         return {"removed": True}
 
     async def space_member_list(self, space: str) -> dict[str, Any]:
@@ -2718,6 +2872,7 @@ class MCPToolHandler:
         found, role = hit
         assert self.spaces is not None
         updated = await self.spaces.update_space(found.id, {"archived_at": datetime.now(UTC)})
+        await self._audit_event("space.archive", found.id, None, {})
         return {"space": self._space_dict(updated, role)}
 
     async def space_unarchive(self, space: str) -> dict[str, Any]:
@@ -2730,6 +2885,7 @@ class MCPToolHandler:
         if not found.archived:
             return {"space": self._space_dict(found, role)}
         updated = await self.spaces.update_space(found.id, {"archived_at": None})
+        await self._audit_event("space.unarchive", found.id, None, {})
         return {"space": self._space_dict(updated, role)}
 
     async def space_erase(self, space: str, confirm_slug: str, dry_run: bool = False) -> dict[str, Any]:
@@ -2754,6 +2910,10 @@ class MCPToolHandler:
             counts = await self.graph.erase_space(found.id)
             await self.spaces.mark_erased(found.id)
         await self._notify("space.erased", {"space_id": found.id})
+        # Audit events outlive the space (spec 8.3); counts only.
+        await self._audit_event("space.erase", found.id, None, {
+            "nodes": counts.get("nodes", 0), "edges": counts.get("edges", 0), "members": members,
+        })
         return {"erased": {"space_id": found.id, "nodes": counts.get("nodes", 0),
                            "edges": counts.get("edges", 0), "members": members}, "dry_run": False}
 
@@ -2799,6 +2959,9 @@ class MCPToolHandler:
             if not keep_original:
                 await self.graph.delete_node(node_id)
                 await self._notify("memory.deleted", {"node_id": node_id})
+            await self._audit_event("memory.promote_in", sid, [result["node_id"]], {
+                "promoted_from": str(original.id), "keep_original": bool(keep_original),
+            })
             return {"node_id": result["node_id"], "space": label}
         finally:
             outer.reset()

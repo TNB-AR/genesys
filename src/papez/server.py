@@ -428,6 +428,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         kwargs[k] = arguments.get(k, default)
 
     roles_token = await _refresh_stdio_space_roles()
+    client_token = _bind_stdio_client_name()
     try:
         result = await method(**kwargs)
     except PermissionError as exc:
@@ -438,9 +439,39 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             f"{type(exc).__name__}: {exc}", retryable=_is_retryable(name, arguments)
         )
     finally:
+        if client_token is not None:
+            current_client.reset(client_token)
         if roles_token is not None:
             current_space_roles.reset(roles_token)
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+def _stdio_client_name() -> str | None:
+    """The MCP client's ``clientInfo.name`` from the initialize handshake, if any."""
+    try:
+        session = app.request_context.session
+    except (LookupError, AttributeError):
+        return None
+    params = getattr(session, "client_params", None)
+    info = getattr(params, "clientInfo", None)
+    name = getattr(info, "name", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _bind_stdio_client_name() -> Any:
+    """Fill ``current_client["client_name"]`` for this call on stdio (spec 8.2, D18).
+
+    ``main()`` sets ``{"transport": "stdio", "client_name": None}``; the name
+    is only known once the client has initialized, so it is read per call
+    from the MCP session. Returns the token to reset, or None when unchanged.
+    """
+    client = current_client.get({})
+    if client.get("transport") != "stdio" or client.get("client_name"):
+        return None
+    name = _stdio_client_name()
+    if name is None:
+        return None
+    return current_client.set({**client, "client_name": name})
 
 
 async def _load_space_roles(registry: Any, principal_id: str) -> dict[str, str]:

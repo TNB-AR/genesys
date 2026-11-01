@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 (unreleased)
+## 0.7.0
 
 Mind Spaces, references and tags, idempotent writes and an audit log. Additive: every new parameter is appended with a default, so existing calls and the `MCPToolHandler(...)` keyword construction keep working. The tool count goes from 13 to 26. Full reference: [`docs/mind-spaces.md`](docs/mind-spaces.md); integration guide: [`docs/integration.md`](docs/integration.md).
 

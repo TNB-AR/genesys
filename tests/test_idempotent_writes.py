@@ -426,3 +426,67 @@ async def test_call_tool_marks_failed_batch_retryable(monkeypatch: pytest.Monkey
     assert json.loads(keyed[0].text)["retryable"] is True
     unkeyed = await srv.call_tool("memory_store_batch", {"items": [{"content": "a"}]})
     assert json.loads(unkeyed[0].text)["retryable"] is False
+
+
+# -- Postgres external_id index (WS-pg) -----------------------------------------
+
+
+def _enforce_postgres_external_id_index(w: SpaceWorld) -> None:
+    """Make the in-memory graph refuse what idx_nodes_external_id_current refuses.
+
+    Postgres keeps one current node per (bucket, external_id); a node only stops
+    being current when a SUPERSEDES edge marks it (superseded_by, D17). So the
+    superseding node cannot be inserted with the external_id before the edge.
+    """
+    from papez.context import current_user_id
+
+    g = w.graph
+    superseded: set[str] = set()
+    create_node, create_edge, update_node = g.create_node, g.create_edge, g.update_node
+
+    def clash(bucket: str, ext: str, nid: str) -> bool:
+        return any(n.external_id == ext and str(n.id) not in superseded and str(n.id) != nid
+                   for n in g._user_nodes.get(bucket, {}).values())
+
+    async def strict_create_node(node: Any) -> str:
+        bucket = space_bucket_key(node.space_id) if node.space_id else current_user_id.get()
+        if node.external_id is not None and clash(bucket, node.external_id, str(node.id)):
+            raise ValueError("external_id_exists")
+        return await create_node(node)
+
+    async def strict_create_edge(edge: Any) -> str:
+        eid = await create_edge(edge)
+        if edge.type == EdgeType.SUPERSEDES:
+            superseded.add(str(edge.target_id))
+        return eid
+
+    async def strict_update_node(node_id: str, updates: dict[str, Any]) -> None:
+        ext = updates.get("external_id")
+        for bucket, nodes in g._user_nodes.items():
+            if ext is not None and node_id in nodes and clash(bucket, ext, node_id):
+                raise ValueError("external_id_exists")
+        await update_node(node_id, updates)
+
+    g.create_node, g.create_edge, g.update_node = strict_create_node, strict_create_edge, strict_update_node
+
+
+@pytest.mark.parametrize("space", ["space", "personal"])
+async def test_amend_paths_respect_postgres_external_id_index(space_world: SpaceWorld, space: str):
+    w = space_world
+    sid = w.a if space == "space" else None
+    _enforce_postgres_external_id_index(w)
+
+    first = await w.alice.call("memory_store", "Rate is 4%", space=sid, refs=[DOC], external_id="rate")
+    stored = await w.alice.call("memory_store", "Rate is 5%", space=sid, refs=[DOC], external_id="rate")
+    assert stored["status"] == "amended" and stored["superseded"] == first["node_id"], stored
+    amended = await w.alice.call("memory_amend", stored["node_id"], "Rate is 6%")
+    assert amended["status"] == "amended", amended
+    batch = await w.alice.call("memory_store_batch", [{"content": "Rate is 7%", "refs": [DOC], "external_id": "rate"}],
+                               space=sid)
+    assert batch["results"][0]["status"] == "amended", batch
+    retired = await w.alice.call("memory_retire_by_ref", "document", "doc_1", space=sid)
+    assert retired == {"retired": 1, "updated": 0, "deleted": 0}, retired
+    current = await _current(w, "rate", sid)
+    assert current.content_full.startswith("[Retired] Rate is 7%")
+    assert await _supersedes(w, str(current.id)) == [batch["results"][0]["node_id"]]
+    assert len([n for n in _with_external_id(w, sid, "rate")]) == 5  # history keeps the id

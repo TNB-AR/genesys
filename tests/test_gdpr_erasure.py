@@ -15,6 +15,23 @@ from papez.models.node import MemoryNode
 from papez.storage.memory import InMemoryCacheProvider, InMemoryGraphProvider
 
 
+def _local_pg_url() -> str:
+    """The caller's DATABASE_URL when it points at localhost, else the local default.
+
+    conftest blanks DATABASE_URL at import, so read the value it saved. A
+    non-local URL is never used: these tests erase users.
+    """
+    import os
+    from urllib.parse import urlparse
+
+    from conftest import _SAVED_ENV
+
+    url = os.environ.get("DATABASE_URL") or _SAVED_ENV.get("DATABASE_URL") or ""
+    if (urlparse(url).hostname or "") in ("localhost", "127.0.0.1", "::1"):
+        return url
+    return "postgresql://genesys:genesys@localhost:5432/genesys"
+
+
 def _make_node(**kwargs) -> MemoryNode:
     defaults = {"content_summary": "test memory", "status": MemoryStatus.ACTIVE}
     defaults.update(kwargs)
@@ -341,7 +358,7 @@ class TestProviderEquivalence:
         assert result["manifest"]["edges_scrubbed"] >= 1
 
     @pytest.mark.asyncio
-    async def test_postgres_delete_all(self):
+    async def test_postgres_delete_all(self, monkeypatch):
         pytest.importorskip("asyncpg")
         try:
             from genesys_server.storage.postgres import PostgresGraphProvider
@@ -350,15 +367,14 @@ class TestProviderEquivalence:
             pytest.skip("genesys-server not installed")
 
         import asyncpg
-        import os
-        db_url = os.environ.get("DATABASE_URL") or "postgresql://genesys:genesys@localhost:5432/genesys"
+        db_url = _local_pg_url()
         try:
             conn = await asyncpg.connect(db_url, timeout=3)
             await conn.close()
         except Exception:
             pytest.skip("Postgres not available")
 
-        os.environ["DATABASE_URL"] = db_url
+        monkeypatch.setenv("DATABASE_URL", db_url)
         graph = PostgresGraphProvider()
         await graph.initialize("user-a")
         await graph.initialize("user-b")
@@ -374,7 +390,7 @@ class TestProviderEquivalence:
             await close_pool()
 
     @pytest.mark.asyncio
-    async def test_postgres_anonymize(self):
+    async def test_postgres_anonymize(self, monkeypatch):
         pytest.importorskip("asyncpg")
         try:
             from genesys_server.storage.postgres import PostgresGraphProvider
@@ -383,15 +399,14 @@ class TestProviderEquivalence:
             pytest.skip("genesys-server not installed")
 
         import asyncpg
-        import os
-        db_url = os.environ.get("DATABASE_URL") or "postgresql://genesys:genesys@localhost:5432/genesys"
+        db_url = _local_pg_url()
         try:
             conn = await asyncpg.connect(db_url, timeout=3)
             await conn.close()
         except Exception:
             pytest.skip("Postgres not available")
 
-        os.environ["DATABASE_URL"] = db_url
+        monkeypatch.setenv("DATABASE_URL", db_url)
         graph = PostgresGraphProvider()
         await graph.initialize("user-a")
         await graph.initialize("user-b")

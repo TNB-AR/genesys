@@ -53,6 +53,7 @@ Mind Spaces, references and tags, idempotent writes and an audit log. Additive: 
 - `space_member_add` asks the `MCPToolHandler.principal_in_org` hook for service principals as well as users; `False` returns `principal_not_in_org` and adds nothing. With no hook set (the library default) nothing changes.
 - `promote_to_org` errors gain codes, text unchanged: "Already org-visible" and "org_id not in caller's org memberships" are `invalid_arguments`, "Only the node owner can promote to org" is `insufficient_role`. `erase_user`'s "Only the user or an admin can erase user data" is `insufficient_role`.
 - `memory_search` accepts `filters={"status": "active"}` (a single string) as well as a list. A bare string used to be read character by character and raised `ValueError`.
+- A superseding write (`memory_amend`, `memory_store` / `memory_store_batch` with `on_existing="amend"`, `memory_retire_by_ref`) creates the new node without its `external_id`, adds the `SUPERSEDES` edge, then sets the `external_id`. Backends that keep `external_id` unique among current memories (the hosted Postgres index) used to reject the insert, so amending a memory that has an `external_id` failed there.
 
 ### Docs
 

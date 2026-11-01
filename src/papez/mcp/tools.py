@@ -872,6 +872,9 @@ class MCPToolHandler:
         summary = _truncate_summary(content)
 
         ts = v.created_at
+        # A superseding node takes the external_id only after the SUPERSEDES
+        # edge: on Postgres that edge is what frees the unique slot (D17).
+        moved_external_id = v.external_id if v.supersedes is not None else None
         node = MemoryNode(
             status=MemoryStatus.ACTIVE,
             content_summary=summary,
@@ -891,7 +894,7 @@ class MCPToolHandler:
             refs=list(v.refs),
             tags=list(v.tags),
             space_id=v.space_id,
-            external_id=v.external_id,
+            external_id=None if moved_external_id is not None else v.external_id,
             promoted_from=v.promoted_from,
         )
 
@@ -908,6 +911,9 @@ class MCPToolHandler:
                 reason=reason,
                 created_by="user_explicit",
             ))
+            if moved_external_id is not None:
+                await self.graph.update_node(node_id, {"external_id": moved_external_id})
+                node.external_id = moved_external_id
 
         # Explicit edges from related_to (legacy caused_by; targets pre-checked)
         for target_id in v.related_to:

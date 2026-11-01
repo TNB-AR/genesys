@@ -218,3 +218,186 @@ def test_memory_node_refs_round_trip():
     assert dumped["refs"] == [{"type": "doc", "id": "1", "url": "https://e/1", "label": None}]
     assert dumped["tags"] == ["a"]
     assert MemoryNode(**dumped).refs == node.refs
+
+
+# -- Tool level (WS-L5): store/recall/search/explain/amend round trips ---------------
+
+from conftest import TokenEmbedder, principal  # noqa: E402
+
+from papez.mcp.tools import MCPToolHandler  # noqa: E402
+from papez.storage.memory import InMemoryCacheProvider, InMemoryGraphProvider  # noqa: E402
+
+_REFS = [
+    {"type": "document", "id": "doc_8812", "label": "Manual Payments Mail Matrix.pdf",
+     "url": "https://docs.example.com/d/doc_8812"},
+    {"type": "meeting", "id": "mtg_2026_10_14", "label": "Payments process review, Oct 14"},
+]
+
+
+def _handler() -> MCPToolHandler:
+    return MCPToolHandler(graph=InMemoryGraphProvider(), embeddings=TokenEmbedder(), cache=InMemoryCacheProvider())
+
+
+async def test_store_and_recall_returns_refs_and_tags():
+    h = _handler()
+    with principal("u1"):
+        stored = await h.memory_store(
+            "Manual payments over 10K ship overnight via FedEx Priority",
+            refs=_REFS, tags=["Manual Payments", "shipping", "Bank A"],
+        )
+        nid = stored["node_id"]
+        full = await h.memory_recall("manual payments ship overnight")
+        concise = await h.memory_recall("manual payments ship overnight", verbosity="concise")
+        search = await h.memory_search("manual payments ship overnight")
+        explain = await h.memory_explain(nid)
+    hit = next(r for r in full["results"] if r["id"] == nid)
+    assert hit["tags"] == ["manual-payments", "shipping", "bank-a"]
+    assert hit["refs"] == _REFS
+    assert hit["space"] is None
+    chit = next(r for r in concise["results"] if r["id"] == nid)
+    assert chit["tags"] == ["manual-payments", "shipping", "bank-a"]
+    assert chit["ref_count"] == 2 and "refs" not in chit and chit["space"] is None
+    shit = next(r for r in search["results"] if r["id"] == nid)
+    assert shit["refs"] == _REFS and shit["tags"] == hit["tags"]
+    assert explain["refs"] == _REFS and explain["tags"] == hit["tags"] and explain["space"] is None
+
+
+@pytest.mark.parametrize("bad,code", [
+    ({"tags": ["q2/2026"]}, "invalid_tag"),
+    ({"tags": [f"t{i}" for i in range(21)]}, "too_many_tags"),
+    ({"refs": [{"type": "Bad Type", "id": "x"}]}, "invalid_ref"),
+    ({"refs": [{"type": "url", "id": "x", "url": "ftp://x"}]}, "invalid_ref"),
+    ({"refs": [{"type": "doc", "id": f"d{i}"} for i in range(21)]}, "too_many_refs"),
+])
+async def test_store_rejects_bad_refs_and_tags_and_creates_nothing(bad, code):
+    h = _handler()
+    with principal("u1"):
+        result = await h.memory_store("rejected", **bad)
+    assert result["code"] == code and "error" in result
+    assert not h.graph._user_nodes.get("u1")
+
+
+async def test_duplicate_refs_stored_once_through_tool():
+    h = _handler()
+    with principal("u1"):
+        res = await h.memory_store("dupes", refs=[{"type": "doc", "id": "1"}, {"type": "doc", "id": "1", "label": "x"}])
+        node = await h.graph.get_node(res["node_id"])
+    assert [(r.type, r.id) for r in node.refs] == [("doc", "1")]
+
+
+async def test_amend_copies_refs_and_tags():
+    h = _handler()
+    with principal("u1"):
+        old = await h.memory_store("original fact", refs=_REFS, tags=["a", "b"])
+        copied = await h.memory_amend(old["node_id"], "corrected fact")
+        replaced = await h.memory_amend(copied["node_id"], "corrected again",
+                                        refs=[{"type": "ticket", "id": "T-1"}], tags=["c"])
+        cleared = await h.memory_amend(replaced["node_id"], "cleared", refs=[], tags=[])
+        n_copied = await h.graph.get_node(copied["node_id"])
+        n_replaced = await h.graph.get_node(replaced["node_id"])
+        n_cleared = await h.graph.get_node(cleared["node_id"])
+        bad = await h.memory_amend(cleared["node_id"], "bad", tags=["no/slash"])
+    assert [r.id for r in n_copied.refs] == ["doc_8812", "mtg_2026_10_14"] and n_copied.tags == ["a", "b"]
+    assert [r.id for r in n_replaced.refs] == ["T-1"] and n_replaced.tags == ["c"]
+    assert n_cleared.refs == [] and n_cleared.tags == []
+    assert bad["code"] == "invalid_tag"
+    assert copied == {"node_id": copied["node_id"], "supersedes": old["node_id"], "status": "amended"}
+
+
+async def test_search_filters():
+    h = _handler()
+    with principal("u1"):
+        n1 = (await h.memory_store("alpha note", tags=["x", "y"], refs=[{"type": "doc", "id": "1"}]))["node_id"]
+        n2 = (await h.memory_store("alpha note two", tags=["x"], refs=[{"type": "ticket", "id": "1"}]))["node_id"]
+        n3 = (await h.memory_store("alpha note three", tags=["z"],
+                                   refs=[{"type": "doc", "id": "2"}, {"type": "ticket", "id": "1"}]))["node_id"]
+
+        async def ids(query: str, filters: dict) -> set[str]:
+            return {r["id"] for r in (await h.memory_search(query, filters, k=10))["results"]}
+
+        for query in ("", "alpha note"):  # enumeration path and vector path agree
+            assert await ids(query, {"tags_any": ["X", "z"]}) == {n1, n2, n3}
+            assert await ids(query, {"tags_any": ["y"]}) == {n1}
+            assert await ids(query, {"tags_all": ["x", "y"]}) == {n1}
+            assert await ids(query, {"tags_all": ["x"]}) == {n1, n2}
+            assert await ids(query, {"ref_type": "doc"}) == {n1, n3}
+            assert await ids(query, {"ref_id": "1"}) == {n1, n2, n3}
+            # same-ref rule: n3 has a doc ref and a ref with id 1, but not doc/1
+            assert await ids(query, {"ref_type": "doc", "ref_id": "1"}) == {n1}
+            assert await ids(query, {"ref_type": "ticket", "ref_id": "1"}) == {n2, n3}
+        bad = await h.memory_search("", {"tags_any": ["a/b"]})
+    assert bad["code"] == "invalid_tag"
+
+
+async def test_search_vector_path_overfetches_before_filtering():
+    h = _handler()
+    with principal("u1"):
+        for i in range(30):
+            await h.memory_store(f"common phrase entry {i}")
+        tagged = (await h.memory_store("common phrase entry tagged", tags=["needle"]))["node_id"]
+        res = await h.memory_search("common phrase entry", {"tags_any": ["needle"]}, k=5)
+    assert [r["id"] for r in res["results"]] == [tagged]
+
+
+async def test_recall_tags_filter_returns_k():
+    h = _handler()
+    with principal("u1"):
+        tagged: set[str] = set()
+        for i in range(50):
+            tags = ["x"] if i % 4 == 0 and len(tagged) < 12 else ["other"]
+            res = await h.memory_store(f"quarterly planning item number {i}", tags=tags)
+            if tags == ["x"]:
+                tagged.add(res["node_id"])
+        assert len(tagged) == 12
+        rec = await h.memory_recall("quarterly planning item", k=10, tags_any=["x"])
+        concise = await h.memory_recall("quarterly planning item", k=10, tags_any=["X"], verbosity="concise")
+        by_type = await h.memory_recall("quarterly planning item", k=10, ref_type="doc")
+    assert rec["count"] == 10
+    assert {r["id"] for r in rec["results"]} <= tagged
+    assert all(r["tags"] == ["x"] for r in rec["results"])
+    assert concise["count"] == 10 and {r["id"] for r in concise["results"]} <= tagged
+    assert by_type["count"] == 0
+
+
+async def test_recall_tag_filter_applies_to_pinned_core_injection():
+    h = _handler()
+    with principal("u1"):
+        pinned = (await h.memory_store("an unrelated pinned preference", tags=["pref"]))["node_id"]
+        await h.pin_memory(pinned)
+        hit = (await h.memory_store("target memory about rockets", tags=["x"]))["node_id"]
+        filtered = await h.memory_recall("rockets", tags_any=["x"])
+        unfiltered = await h.memory_recall("rockets")
+    assert {r["id"] for r in filtered["results"]} == {hit}
+    assert pinned in {r["id"] for r in unfiltered["results"]}
+
+
+async def test_not_found_errors_carry_code():
+    h = _handler()
+    missing = "00000000-0000-4000-8000-000000000000"
+    with principal("u1"):
+        for tool in ("memory_explain", "pin_memory", "unpin_memory", "delete_memory"):
+            assert await getattr(h, tool)(missing) == {"error": "Node not found", "code": "not_found",
+                                                      "node_id": missing}
+        assert (await h.memory_amend(missing, "x"))["code"] == "not_found"
+        assert (await h.promote_to_org(missing, "org"))["code"] == "not_found"
+        assert (await h.memory_traverse(missing))["code"] == "not_found"
+
+
+async def test_event_payload_carries_identity():
+    from papez.storage.memory import InMemoryEventBusProvider
+
+    bus = InMemoryEventBusProvider()
+    seen: list[dict] = []
+
+    async def capture(payload: dict) -> None:
+        seen.append(payload)
+
+    await bus.subscribe("memory.created", capture)
+    h = MCPToolHandler(graph=InMemoryGraphProvider(), embeddings=None, cache=InMemoryCacheProvider(), event_bus=bus)
+    with principal("u1", orgs=["org_1"]):
+        res = await h.memory_store("payload check")
+    import asyncio
+
+    await asyncio.sleep(0)
+    assert seen and seen[0]["node_id"] == res["node_id"]
+    assert seen[0]["user_id"] == "u1" and seen[0]["org_ids"] == ["org_1"] and seen[0]["space_id"] is None

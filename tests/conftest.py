@@ -234,3 +234,189 @@ def forbidden_llm() -> ForbiddenLLM:
 @pytest.fixture()
 def recording_llm() -> RecordingLLM:
     return RecordingLLM()
+
+
+# ---------------------------------------------------------------------------
+# space_world (WS-L5): org org_r, users alice/bob, service svc_a, spaces A/B
+# ---------------------------------------------------------------------------
+
+
+class TokenEmbedder:
+    """Bag-of-words embedder: near-identical texts get near-identical vectors.
+
+    Unlike ``FakeEmbedder`` (hash of the whole text), this makes "Bank A pilot
+    starts in Q1" and "... Q2" nearest neighbours, so a scope leak would show
+    up in vector search, auto-link and conflict hints.
+    """
+
+    dimension = 64
+
+    async def embed(self, text: str) -> list[float]:
+        vec = [0.0] * self.dimension
+        for token in text.lower().split():
+            token = token.strip(".,!?;:'\"()")
+            if not token:
+                continue
+            h = int.from_bytes(hashlib.sha256(token.encode("utf-8")).digest()[:4], "big")
+            vec[h % self.dimension] += 1.0
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        return [x / norm for x in vec]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+
+WORLD_ORG = "org_r"
+
+
+class Actor:
+    """Acts as one principal against the shared world.
+
+    Every call reloads the principal's roles from the registry first, exactly
+    as the stdio transport does per call (``server.call_tool``), so membership
+    changes take effect on the next call.
+    """
+
+    def __init__(self, world: SpaceWorld, uid: str, principal_type: str = "user", orgs: Sequence[str] = (WORLD_ORG,)):
+        self.world = world
+        self.uid = uid
+        self.principal_type = principal_type
+        self.orgs = list(orgs)
+
+    async def roles(self) -> dict[str, str]:
+        roles = await self.world.registry.roles_for_principal(self.uid)
+        return {sid: str(getattr(r, "value", r)) for sid, r in roles.items()}
+
+    @contextmanager
+    def _ctx(self, roles: Mapping[str, str]) -> Iterator[None]:
+        with principal(self.uid, orgs=self.orgs, roles=roles, principal_type=self.principal_type):
+            yield
+
+    async def call(self, tool: str, *args: Any, **kwargs: Any) -> Any:
+        roles = await self.roles()
+        with self._ctx(roles):
+            return await getattr(self.world.handler, tool)(*args, **kwargs)
+
+    async def storage(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        """Call a graph method directly with this principal's full membership scope."""
+        roles = await self.roles()
+        with self._ctx(roles):
+            return await getattr(self.world.graph, method)(*args, **kwargs)
+
+
+class SpaceWorld:
+    """Shared graph + registry + audit sink + one handler, three actors."""
+
+    def __init__(self, graph: Any, registry: Any, audit: Any, handler: Any) -> None:
+        self.graph = graph
+        self.registry = registry
+        self.audit = audit
+        self.handler = handler
+        self.org = WORLD_ORG
+        self.alice = Actor(self, "alice")
+        self.bob = Actor(self, "bob")
+        self.svc = Actor(self, "svc_a", principal_type="service")
+        self.space_a: Any = None
+        self.space_b: Any = None
+        # label -> node id for the seeded content
+        self.ids: dict[str, str] = {}
+
+    def actor(self, uid: str, principal_type: str = "user", orgs: Sequence[str] = (WORLD_ORG,)) -> Actor:
+        return Actor(self, uid, principal_type, orgs)
+
+    @property
+    def a(self) -> str:
+        return str(self.space_a.id)
+
+    @property
+    def b(self) -> str:
+        return str(self.space_b.id)
+
+    def ids_in(self, *labels: str) -> set[str]:
+        return {self.ids[label] for label in labels}
+
+    @property
+    def a_ids(self) -> set[str]:
+        return {v for k, v in self.ids.items() if k.startswith("a_")}
+
+    @property
+    def b_ids(self) -> set[str]:
+        return {v for k, v in self.ids.items() if k.startswith("b_")}
+
+    @property
+    def personal_ids(self) -> set[str]:
+        return {v for k, v in self.ids.items() if k.startswith("p_")}
+
+
+async def build_space_world(embedder: Any | None = None, llm: Any | None = None) -> SpaceWorld:
+    """Org ``org_r``; spaces A (alice owner, svc_a writer) and B (bob owner).
+
+    Seeds near-identical content with shared tags, entities and refs in A, B
+    and alice's personal memory, plus one same-scope edge in each.
+    """
+    from papez.mcp.tools import MCPToolHandler
+    from papez.models.enums import PrincipalType, SpaceRole
+    from papez.models.space import SpaceMember
+    from papez.storage.audit import InMemoryAuditSink
+    from papez.storage.memory import InMemoryCacheProvider, InMemoryGraphProvider
+    from papez.storage.spaces import InMemorySpaceRegistry
+
+    graph = InMemoryGraphProvider()
+    registry = InMemorySpaceRegistry()
+    audit = InMemoryAuditSink()
+    handler = MCPToolHandler(
+        graph=graph,
+        embeddings=embedder if embedder is not None else TokenEmbedder(),
+        cache=InMemoryCacheProvider(),
+        llm=llm,
+        spaces=registry,
+        audit=audit,
+    )
+    world = SpaceWorld(graph, registry, audit, handler)
+
+    created_a = await world.alice.call("space_create", "Space A", slug="space-a")
+    created_b = await world.bob.call("space_create", "Space B", slug="space-b")
+    world.space_a = await registry.get_space(created_a["space"]["id"])
+    world.space_b = await registry.get_space(created_b["space"]["id"])
+    await registry.add_member(SpaceMember(
+        space_id=world.a, principal_id="svc_a", principal_type=PrincipalType.SERVICE,
+        role=SpaceRole.WRITER, added_by="alice",
+    ))
+
+    shared_refs = [{"type": "document", "id": "doc_bank_a", "label": "Bank A pilot plan"}]
+    shared_tags = ["bank-a", "pilot"]
+
+    async def seed(actor: Actor, label: str, content: str, space: str | None, **extra: Any) -> None:
+        result = await actor.call(
+            "memory_store", content, space=space, tags=shared_tags, refs=shared_refs, **extra,
+        )
+        assert "error" not in result, result
+        world.ids[label] = result["node_id"]
+
+    await seed(world.alice, "a_q1", "Bank A pilot starts in Q1", world.a)
+    await seed(world.alice, "a_ctx", "Bank A pilot budget approved for the payments team", world.a)
+    await seed(world.bob, "b_q2", "Bank A pilot starts in Q2", world.b)
+    await seed(world.bob, "b_ctx", "Bank A pilot budget approved for the payments team", world.b)
+    await seed(world.alice, "p_notes", "Bank A pilot notes", None)
+    await seed(world.alice, "p_more", "Bank A pilot budget approved for the payments team", None)
+
+    # Same-scope explicit edges (never across scopes) and shared entity names.
+    from papez.models.edge import MemoryEdge
+
+    pairs = [("alice", "a_ctx", "a_q1"), ("bob", "b_ctx", "b_q2"), ("alice", "p_more", "p_notes")]
+    for uid, src, dst in pairs:
+        actor = world.alice if uid == "alice" else world.bob
+        roles = await actor.roles()
+        with principal(uid, orgs=[WORLD_ORG], roles=roles):
+            await graph.create_edge(MemoryEdge(
+                source_id=world.ids[src], target_id=world.ids[dst], type=EdgeType.CAUSED_BY,
+                weight=0.9, created_by="user_explicit",
+            ))
+            await graph.update_node(world.ids[src], {"entity_refs": ["Bank A", "Payments"]})
+            await graph.update_node(world.ids[dst], {"entity_refs": ["Bank A", "Payments"]})
+    return world
+
+
+@pytest.fixture()
+async def space_world() -> SpaceWorld:
+    return await build_space_world()

@@ -1,19 +1,47 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from papez.context import current_org_ids, current_user_id, current_user_role
+from papez.context import (
+    current_client,
+    current_include_personal,
+    current_org_ids,
+    current_principal_type,
+    current_scope_space_ids,
+    current_space_roles,
+    current_user_id,
+    current_user_role,
+)
 from papez.core_memory.preferences import CoreMemoryPreferences
 from papez.core_memory.promoter import evaluate_core_promotion
 from papez.models.edge import MemoryEdge
-from papez.models.enums import EdgeType, MemoryStatus, Visibility
+from papez.models.enums import (
+    SPACE_ROLE_RANK,
+    EdgeType,
+    ForgettingPolicy,
+    MemoryStatus,
+    PrincipalType,
+    SpaceRole,
+    Visibility,
+)
 from papez.models.node import MemoryNode
-from papez.storage.base import CacheProvider, EmbeddingProvider, EventBusProvider, GraphStorageProvider
+from papez.models.ref import Ref, ValidationFailure, normalize_tags, validate_refs
+from papez.models.space import SLUG_PATTERN, Space, SpaceMember
+from papez.storage.base import (
+    AuditSink,
+    CacheProvider,
+    EmbeddingProvider,
+    EventBusProvider,
+    GraphStorageProvider,
+    SpaceRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +146,131 @@ def _live_connectivity_factor(causal_weight: int, max_causal_weight: int, is_orp
     return cf
 
 
+# ---------------------------------------------------------------------------
+# Mind Spaces: error shapes, per-call scope, store request (spec 6-7, 10)
+# ---------------------------------------------------------------------------
+
+
+def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
+    """Spec Section 10 error dict ``{"error", "code"}`` (plus optional extras)."""
+    out: dict[str, Any] = {"error": message, "code": code}
+    out.update(extra)
+    return out
+
+
+def _not_found(node_id: str) -> dict[str, Any]:
+    """Identical for a missing node and an invisible one (spec 10 ``not_found``)."""
+    return {"error": "Node not found", "code": "not_found", "node_id": node_id}
+
+
+def _space_not_found() -> dict[str, Any]:
+    """Never echoes the requested id/slug: a missing space and a non-member's
+    space must produce byte-identical bodies (spec 6.7)."""
+    return _error("space_not_found", "Space not found")
+
+
+def _is_service() -> bool:
+    return current_principal_type.get(PrincipalType.USER.value) == PrincipalType.SERVICE.value
+
+
+def _role_value(role: Any) -> str:
+    return str(getattr(role, "value", role))
+
+
+def _ref_dump(ref: Ref) -> dict[str, Any]:
+    return ref.model_dump(mode="json", exclude_none=True)
+
+
+def _ref_identity(ref: Ref) -> tuple[str, str, str | None, str | None]:
+    return (ref.type, ref.id, ref.url, ref.label)
+
+
+def _matches_tags_and_ref_type(node: MemoryNode, tags_any: list[str] | None, ref_type: str | None) -> bool:
+    if tags_any and not set(tags_any).intersection(node.tags):
+        return False
+    if ref_type and not any(r.type == ref_type for r in node.refs):
+        return False
+    return True
+
+
+class _Scope:
+    """Result of ``MCPToolHandler._resolve_scope`` (D06).
+
+    ``error`` is a ``{"error", "code"}`` dict to return immediately, or None.
+    ``space_ids``/``include_personal`` are what was put into the context for
+    this call; ``spaces`` maps space id -> ``Space`` (for result labels);
+    ``roles`` maps space id -> role for every space in scope. ``reset()``
+    restores the context variables and is safe to call more than once.
+    """
+
+    def __init__(
+        self,
+        error: dict[str, Any] | None = None,
+        space_ids: list[str] | None = None,
+        include_personal: bool = False,
+        spaces: dict[str, Space] | None = None,
+        roles: dict[str, str] | None = None,
+        tokens: list[tuple[Any, Any]] | None = None,
+    ) -> None:
+        self.error = error
+        self.space_ids: list[str] = list(space_ids or [])
+        self.include_personal = include_personal
+        self.spaces: dict[str, Space] = dict(spaces or {})
+        self.roles: dict[str, str] = dict(roles or {})
+        self._tokens: list[tuple[Any, Any]] = list(tokens or [])
+
+    def reset(self) -> None:
+        while self._tokens:
+            var, token = self._tokens.pop()
+            var.reset(token)
+
+
+@dataclass
+class _StoreRequest:
+    content: str
+    source_session: str = ""
+    related_to: list[str] | None = None
+    created_at: str | None = None
+    visibility: str = "private"
+    org_id: str | None = None
+    related: list[dict[str, Any]] | None = None
+    category: str | None = None
+    refs: list[Any] | None = None
+    tags: list[Any] | None = None
+    space_id: str | None = None
+    external_id: str | None = None
+    on_existing: str = "amend"
+
+
+@dataclass
+class _Validated:
+    """Everything ``_write_memory`` needs; produced only by validation (D08)."""
+
+    content: str
+    source_session: str
+    visibility: Visibility
+    org_id: str | None
+    category: str | None
+    refs: list[Ref]
+    tags: list[str]
+    space_id: str | None
+    created_at: datetime
+    related_to: list[str] = field(default_factory=list)
+    related: list[tuple[str, EdgeType]] = field(default_factory=list)
+    explicit_requested: bool = False
+    external_id: str | None = None
+    on_existing: str = "amend"
+    existing: MemoryNode | None = None
+    source_agent: str = "claude"
+    promoted_from: str | None = None
+    supersedes: tuple[str, str] | None = None  # (old node id, reason)
+
+
+_ON_EXISTING = ("skip", "amend", "error")
+_SLUG_RE = re.compile(SLUG_PATTERN)
+_EXTERNAL_ID_MAX = 256
+
+
 class MCPToolHandler:
     def __init__(
         self,
@@ -127,6 +280,8 @@ class MCPToolHandler:
         event_bus: EventBusProvider | None = None,
         on_change: Callable[..., Any] | None = None,
         llm: object | None = None,
+        spaces: SpaceRegistry | None = None,
+        audit: AuditSink | None = None,
     ):
         self.graph = graph
         self.embeddings = embeddings
@@ -134,6 +289,12 @@ class MCPToolHandler:
         self.event_bus = event_bus
         self.on_change = on_change
         self.llm = llm
+        self.spaces = spaces
+        self.audit = audit
+        # Optional org directory hook for space_member_add's principal_not_in_org
+        # check: ``async (org_id, principal_id) -> bool``. The library has no org
+        # directory, so when this is None the check is skipped (hosted sets it).
+        self.principal_in_org: Callable[[str, str], Any] | None = None
         self.preferences = CoreMemoryPreferences(cache)
 
     def _defer_saves(self) -> AbstractContextManager[None]:
@@ -143,9 +304,256 @@ class MCPToolHandler:
                 return self.graph.defer_saves()  # type: ignore[attr-defined,no-any-return]
         return nullcontext()
 
+    def _atomic(self) -> AbstractAsyncContextManager[Any]:
+        """``graph.atomic()`` when the provider defines one, else a no-op (D08).
+
+        Detected on the class (like ``_defer_saves``) so a Mock graph, whose
+        attributes all exist, never pretends to be transactional.
+        """
+        for cls in type(self.graph).__mro__:
+            if 'atomic' in cls.__dict__:
+                return self.graph.atomic()  # type: ignore[attr-defined,no-any-return]
+        return nullcontext()
+
     async def _notify(self, event_type: str, data: dict[str, Any]) -> None:
         if self.on_change:
             await self.on_change(event_type, data)
+
+    async def _audit_event(
+        self,
+        action: str,
+        space_id: str,
+        node_ids: list[str] | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Record one audit event (spec 8.2). No-op when no sink is configured.
+
+        WS-L7 wires the call sites. Never pass memory content or query text:
+        ids, counts and lengths only.
+        """
+        if self.audit is None:
+            return
+        from papez.engine import config
+
+        event: dict[str, Any] = {
+            "space_id": space_id,
+            "principal_id": _caller_uid(),
+            "principal_type": current_principal_type.get(PrincipalType.USER.value),
+            "action": action,
+            "node_ids": list(node_ids or [])[: config.AUDIT_READ_NODE_IDS_CAP],
+            "detail": dict(detail or {}),
+            "client": dict(current_client.get({})),
+        }
+        try:
+            await self.audit.record(event)
+        except Exception:
+            logger.warning("audit record failed for %s on %s", action, space_id, exc_info=True)
+
+    # -- scope and authorization (D06, D07) -------------------------------------
+
+    async def _lookup_space(self, ref: str, roles: dict[str, str]) -> tuple[Space | None, str] | None:
+        """Resolve an id or slug to ``(space, role)`` for the caller, or None.
+
+        Order: exact id in ``current_space_roles``; else (with a registry) an id
+        or a slug within each of the caller's orgs, accepted only when the
+        caller is a member (archived memberships come from the registry, since
+        ``current_space_roles`` holds non-archived spaces only).
+        """
+        if ref in roles:
+            if self.spaces is None:
+                return None, roles[ref]
+            space = await self.spaces.get_space(ref)
+            if space is None:
+                return None  # erased (or stale roles): indistinguishable from missing
+            return space, roles[ref]
+        if self.spaces is None:
+            return None
+        found = await self.spaces.get_space(ref)
+        if found is None:
+            for org_id in current_org_ids.get([]):
+                found = await self.spaces.get_space_by_slug(org_id, ref)
+                if found is not None:
+                    break
+        if found is None:
+            return None
+        if found.id in roles:
+            return found, roles[found.id]
+        uid = _caller_uid()
+        if uid is None:
+            return None
+        all_roles = await self.spaces.roles_for_principal(uid, include_archived=True)
+        role = all_roles.get(found.id)
+        if role is None or (not found.archived and found.id not in roles):
+            # A non-archived membership missing from current_space_roles means
+            # the roles were (re)loaded without it: treat as not a member.
+            return None
+        return found, _role_value(role)
+
+    async def _resolve_scope(
+        self,
+        space: str | None,
+        spaces: list[str] | None,
+        include_personal: bool | None,
+        need_role: SpaceRole | str | None,
+        default_scope: str = "memberships",
+        *,
+        allow_archived: bool | None = None,
+        include_archived_memberships: bool = False,
+    ) -> _Scope:
+        """Validate the requested scope and set the per-call context (spec 7.4, D06).
+
+        ``default_scope`` applies when neither ``space`` nor ``spaces`` is given:
+        ``"memberships"`` = every key of ``current_space_roles`` plus personal;
+        ``"personal"`` = personal only. ``allow_archived`` defaults to True for
+        reads and False for writes (``need_role`` writer/owner). The caller MUST
+        call ``reset()`` on the result (``try/finally``).
+        """
+        if space is not None and spaces is not None:
+            return _Scope(error=_error("invalid_arguments", "pass either `space` or `spaces`, not both"))
+        if spaces is not None and (not isinstance(spaces, list) or not all(isinstance(s, str) for s in spaces)):
+            return _Scope(error=_error("invalid_arguments", "`spaces` must be a list of space ids or slugs"))
+        if include_personal is not None and not isinstance(include_personal, bool):
+            return _Scope(error=_error("invalid_arguments", "`include_personal` must be a boolean"))
+        need = SpaceRole(need_role) if need_role is not None else None
+        is_write = need in (SpaceRole.WRITER, SpaceRole.OWNER)
+        if allow_archived is None:
+            allow_archived = not is_write
+        service = _is_service()
+        roles = {sid: _role_value(r) for sid, r in current_space_roles.get({}).items()}
+
+        requested: list[str] | None = None
+        if space is not None:
+            requested = [space]
+        elif spaces is not None:
+            requested = list(spaces)
+
+        labels: dict[str, Space] = {}
+        scope_roles: dict[str, str] = {}
+        scope_ids: list[str] = []
+        if requested is not None:
+            for ref in requested:
+                if not isinstance(ref, str) or not ref:
+                    return _Scope(error=_space_not_found())
+                hit = await self._lookup_space(ref, roles)
+                if hit is None:
+                    return _Scope(error=_space_not_found())
+                found, role = hit
+                sid = found.id if found is not None else ref
+                if found is not None and found.archived and not allow_archived:
+                    return _Scope(error=_error("space_archived", "This space is archived and read-only"))
+                if need is not None and SPACE_ROLE_RANK[SpaceRole(role)] < SPACE_ROLE_RANK[need]:
+                    return _Scope(error=_error(
+                        "insufficient_role", f"This action needs the {need.value} role in the space",
+                    ))
+                if sid not in scope_ids:
+                    scope_ids.append(sid)
+                    scope_roles[sid] = role
+                    if found is not None:
+                        labels[sid] = found
+            personal = (not service) and include_personal is True
+        else:
+            if service and is_write:
+                return _Scope(error=_error(
+                    "space_required", "A service principal must name a `space` to write to",
+                ))
+            if default_scope == "memberships":
+                scope_roles = dict(roles)
+                if include_archived_memberships and self.spaces is not None:
+                    uid = _caller_uid()
+                    if uid is not None:
+                        archived = await self.spaces.roles_for_principal(uid, include_archived=True)
+                        for sid, r in archived.items():
+                            scope_roles.setdefault(sid, _role_value(r))
+                scope_ids = list(scope_roles)
+                if self.spaces is not None:
+                    for sid in scope_ids:
+                        found = await self.spaces.get_space(sid)
+                        if found is not None:
+                            labels[sid] = found
+            personal = (not service) and include_personal is not False
+
+        tokens: list[tuple[Any, Any]] = [
+            (current_scope_space_ids, current_scope_space_ids.set(list(scope_ids))),
+            (current_include_personal, current_include_personal.set(personal)),
+        ]
+        return _Scope(
+            space_ids=scope_ids, include_personal=personal, spaces=labels, roles=scope_roles, tokens=tokens,
+        )
+
+    async def _node_scope(self, include_archived: bool = True) -> _Scope:
+        """Scope for node-addressed tools (no ``space`` param): full memberships.
+
+        Archived memberships are included for the write tools so they answer
+        ``space_archived`` rather than ``not_found``.
+        """
+        return await self._resolve_scope(
+            None, None, None, None, "memberships", include_archived_memberships=include_archived,
+        )
+
+    @contextmanager
+    def _narrow_scope(self, space_id: str | None) -> Iterator[None]:
+        """Scope a write's storage calls to the new node's own scope (6.6).
+
+        A space node sees only its space; a personal node sees personal + org,
+        exactly as before spaces existed.
+        """
+        t1 = current_scope_space_ids.set([space_id] if space_id else [])
+        t2 = current_include_personal.set(space_id is None)
+        try:
+            yield
+        finally:
+            current_include_personal.reset(t2)
+            current_scope_space_ids.reset(t1)
+
+    async def _authorize_write(self, node: MemoryNode, owner_message: str) -> dict[str, Any] | None:
+        """Writer/owner for space nodes; ``_caller_owns_node`` for personal (D07)."""
+        if node.space_id is None:
+            if not _caller_owns_node(node):
+                return _error("insufficient_role", owner_message)
+            return None
+        sid = node.space_id
+        role = {k: _role_value(v) for k, v in current_space_roles.get({}).items()}.get(sid)
+        space: Space | None = None
+        if self.spaces is not None:
+            space = await self.spaces.get_space(sid)
+            if space is None:
+                return _not_found(str(node.id))
+            if role is None:
+                uid = _caller_uid()
+                if uid is not None:
+                    all_roles = await self.spaces.roles_for_principal(uid, include_archived=True)
+                    if sid in all_roles and space.archived:
+                        role = _role_value(all_roles[sid])
+        if role is None:
+            return _not_found(str(node.id))
+        if space is not None and space.archived:
+            return _error("space_archived", "This space is archived and read-only")
+        if SPACE_ROLE_RANK[SpaceRole(role)] < SPACE_ROLE_RANK[SpaceRole.WRITER]:
+            return _error("insufficient_role", "This action needs the writer role in the space")
+        return None
+
+    @staticmethod
+    def _space_label(space_id: str | None, labels: dict[str, Space] | None) -> dict[str, Any] | None:
+        if space_id is None:
+            return None
+        space = (labels or {}).get(space_id)
+        return {
+            "id": space_id,
+            "slug": space.slug if space is not None else None,
+            "name": space.name if space is not None else None,
+        }
+
+    async def _labels_for(self, space_ids: list[str]) -> dict[str, Space]:
+        out: dict[str, Space] = {}
+        if self.spaces is None:
+            return out
+        for sid in dict.fromkeys(space_ids):
+            found = await self.spaces.get_space(sid)
+            if found is not None:
+                out[sid] = found
+        return out
+
+    # -- writes (D08) -------------------------------------------------------------
 
     async def memory_store(
         self,
@@ -157,6 +565,11 @@ class MCPToolHandler:
         org_id: str | None = None,
         related: list[dict[str, str]] | None = None,
         category: str | None = None,
+        refs: list[dict[str, Any]] | None = None,
+        tags: list[str] | None = None,
+        space: str | None = None,
+        external_id: str | None = None,
+        on_existing: str = "amend",
     ) -> dict[str, Any]:
         """Store a new memory. Returns the node ID.
 
@@ -180,36 +593,201 @@ class MCPToolHandler:
             created_at: Optional ISO 8601 timestamp. Defaults to now.
             visibility: "private" or "org". Defaults to "private".
             org_id: Required when visibility is "org".
+            refs: Sources, each ``{type, id, url?, label?}`` (spec 5.2).
+            tags: Labels; normalized to lowercase-with-dashes.
+            space: Space id or slug to write into (writer or owner).
+            external_id: The caller's own id for this memory (unique per space
+                among current memories). ``on_existing`` decides what happens
+                when a current memory already carries it.
 
-        The result may include ``possible_conflicts`` — heuristic hints (lexical
+        Validation (visibility, edge types, ids, refs, tags, same-space
+        targets) runs completely before anything is written. The result may
+        include ``possible_conflicts`` — heuristic hints (lexical
         numeric/negation divergence against auto-link candidates), not verified
         contradictions, and never materialized as edges.
         """
-        vis = Visibility(visibility)
-        if vis == Visibility.ORG and not org_id:
-            return {"error": "org_id required when visibility is 'org'"}
-        if vis == Visibility.ORG and org_id not in current_org_ids.get([]):
-            return {"error": "org_id not in caller's org memberships"}
+        scope = await self._resolve_scope(space, None, None, SpaceRole.WRITER, "memberships")
+        if scope.error is not None:
+            return scope.error
+        try:
+            space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
+            validated = await self._validate_store(_StoreRequest(
+                content=content,
+                source_session=source_session,
+                related_to=related_to,
+                created_at=created_at,
+                visibility=visibility,
+                org_id=org_id,
+                related=related,
+                category=category,
+                refs=refs,
+                tags=tags,
+                space_id=space_id,
+                external_id=external_id,
+                on_existing=on_existing,
+            ))
+            if isinstance(validated, dict):
+                return validated
+            if validated.existing is not None:
+                result = await self._apply_on_existing(validated)
+            else:
+                result = await self._write_memory(validated)
+            if space_id is not None and "error" not in result:
+                result["space"] = self._space_label(space_id, scope.spaces)
+            return result
+        finally:
+            scope.reset()
 
-        # Validate typed relations up front — explicit writes must not
-        # half-succeed (fail fast before the node is ever created).
+    async def _validate_store(self, req: _StoreRequest) -> _Validated | dict[str, Any]:
+        """Every check a store needs, with no side effects (D08).
+
+        Targets of ``related``/``related_to`` are resolved under the caller's
+        current scope. A space write refuses any target that is not a visible
+        node of the same space (``cross_space_edge``); a personal write refuses
+        a visible space target and keeps the legacy warn-and-skip for targets
+        it cannot see.
+        """
+        from papez.engine import config
+
+        vis = Visibility(req.visibility)
+        space_id = req.space_id
+        if space_id is not None and vis == Visibility.ORG:
+            return _error("invalid_arguments", "visibility='org' can't be combined with `space`")
+        if vis == Visibility.ORG and not req.org_id:
+            return _error("invalid_arguments", "org_id required when visibility is 'org'")
+        if vis == Visibility.ORG and req.org_id not in current_org_ids.get([]):
+            return _error("invalid_arguments", "org_id not in caller's org memberships")
+        if not isinstance(req.content, str) or not req.content.strip():
+            return _error("invalid_arguments", "content must be a non-empty string")
+
         parsed_related: list[tuple[str, EdgeType]] = []
-        if related:
-            for item in related:
+        if req.related:
+            for item in req.related:
+                if not isinstance(item, dict):
+                    return _error("invalid_arguments", "each `related` entry must be an object {id, type}")
                 raw_type = item.get("type")
                 try:
                     etype = EdgeType(raw_type)
                 except (ValueError, KeyError):
                     return {
                         "error": f"invalid edge type: {raw_type}",
+                        "code": "invalid_arguments",
                         "valid_types": [e.value for e in EdgeType],
                     }
-                parsed_related.append((item["id"], etype))
+                target = item.get("id")
+                if not isinstance(target, str) or not target:
+                    return _error("invalid_arguments", "each `related` entry needs an `id`")
+                parsed_related.append((target, etype))
 
+        try:
+            refs = validate_refs(req.refs, max_refs=config.MAX_REFS_PER_MEMORY)
+            tags = normalize_tags(req.tags, max_tag_length=config.MAX_TAG_LENGTH, max_tags=config.MAX_TAGS_PER_MEMORY)
+        except ValidationFailure as exc:
+            return exc.as_error()
+
+        if req.external_id is not None:
+            if not isinstance(req.external_id, str) or not req.external_id or len(req.external_id) > _EXTERNAL_ID_MAX:
+                return _error("invalid_arguments", f"external_id must be 1-{_EXTERNAL_ID_MAX} characters")
+        if req.on_existing not in _ON_EXISTING:
+            return _error("invalid_arguments", "on_existing must be one of 'skip', 'amend', 'error'")
+
+        ts = _parse_iso_utc(req.created_at) if req.created_at else datetime.now(UTC)
+
+        resolved_related_to: list[str] = []
+        for target_id in req.related_to or []:
+            ok = await self._check_target(target_id, space_id, "related_to")
+            if isinstance(ok, dict):
+                return ok
+            if ok:
+                resolved_related_to.append(target_id)
+        resolved_related: list[tuple[str, EdgeType]] = []
+        for target_id, etype in parsed_related:
+            ok = await self._check_target(target_id, space_id, "related")
+            if isinstance(ok, dict):
+                return ok
+            if ok:
+                resolved_related.append((target_id, etype))
+
+        existing: MemoryNode | None = None
+        if req.external_id is not None:
+            existing = await self.graph.find_node_by_external_id(req.external_id, space_id)
+
+        return _Validated(
+            content=req.content,
+            source_session=req.source_session,
+            visibility=Visibility.PRIVATE if space_id is not None else vis,
+            org_id=None if space_id is not None else req.org_id,
+            category=req.category,
+            refs=refs,
+            tags=tags,
+            space_id=space_id,
+            created_at=ts,
+            related_to=resolved_related_to,
+            related=resolved_related,
+            explicit_requested=bool(req.related_to or parsed_related),
+            external_id=req.external_id,
+            on_existing=req.on_existing,
+            existing=existing,
+        )
+
+    async def _check_target(self, target_id: str, space_id: str | None, kind: str) -> bool | dict[str, Any]:
+        """True = link it, False = skip it (legacy personal rule), dict = refuse."""
+        target = await self.graph.get_node(target_id) if isinstance(target_id, str) else None
+        if target is None:
+            if space_id is not None:
+                return _error("cross_space_edge", f"{kind} id {target_id} is not in this space")
+            logger.warning(
+                "%s target %s not visible to caller %s; skipping edge", kind, target_id, _caller_uid(),
+            )
+            return False
+        if target.space_id != space_id:
+            where = "this space" if space_id is not None else "personal memory"
+            return _error("cross_space_edge", f"{kind} id {target_id} is not in {where}")
+        try:
+            uuid.UUID(target_id)
+        except ValueError:
+            return _error("invalid_arguments", f"invalid node id: {target_id}")
+        return True
+
+    async def _apply_on_existing(self, v: _Validated) -> dict[str, Any]:
+        """The spec 9.3 matrix for a store whose external_id already exists."""
+        existing = v.existing
+        assert existing is not None
+        existing_id = str(existing.id)
+        if v.on_existing == "skip":
+            return {"node_id": existing_id, "status": "exists"}
+        if v.on_existing == "error":
+            return _error("external_id_exists", "A current memory with this external_id already exists",
+                          node_id=existing_id)
+        same_content = (existing.content_full or existing.content_summary).strip() == v.content.strip()
+        same_refs = {_ref_identity(r) for r in existing.refs} == {_ref_identity(r) for r in v.refs}
+        same_tags = set(existing.tags) == set(v.tags)
+        if same_content and same_refs and same_tags:
+            return {"node_id": existing_id, "status": "unchanged"}
+        v.supersedes = (existing_id, "external_id update")
+        v.source_session = v.source_session or existing.source_session
+        v.category = v.category if v.category is not None else existing.category
+        v.existing = None
+        result = await self._write_memory(v)
+        if "error" in result:
+            return result
+        await self._notify("memory.amended", {"node_id": result["node_id"], "supersedes": existing_id})
+        return {"node_id": result["node_id"], "status": "amended", "superseded": existing_id,
+                "visibility": result.get("visibility", v.visibility.value)}
+
+    async def _write_memory(self, v: _Validated) -> dict[str, Any]:
+        """Create the node and its edges from an already-validated request (D08)."""
+        with self._narrow_scope(v.space_id):
+            return await self._write_memory_scoped(v)
+
+    async def _write_memory_scoped(self, v: _Validated) -> dict[str, Any]:
+        content = v.content
+        vis = v.visibility
+        org_id = v.org_id
         embedding = await self.embeddings.embed(content) if self.embeddings else []
         summary = _truncate_summary(content)
 
-        ts = _parse_iso_utc(created_at) if created_at else datetime.now(UTC)
+        ts = v.created_at
         node = MemoryNode(
             status=MemoryStatus.ACTIVE,
             content_summary=summary,
@@ -220,53 +798,52 @@ class MCPToolHandler:
             last_reactivated_at=ts,
             decay_score=1.0,
             causal_weight=0,
-            source_agent="claude",
-            source_session=source_session,
-            category=category,
+            source_agent=v.source_agent,
+            source_session=v.source_session,
+            category=v.category,
             visibility=vis,
             org_id=org_id,
             original_user_id=_caller_uid(),
+            refs=list(v.refs),
+            tags=list(v.tags),
+            space_id=v.space_id,
+            external_id=v.external_id,
+            promoted_from=v.promoted_from,
         )
 
         node_id = await self.graph.create_node(node)
 
-        # Explicit edges from related_to (legacy caused_by, with visibility check)
-        if related_to:
-            for target_id in related_to:
-                target_node = await self.graph.get_node(target_id)
-                if target_node is None:
-                    logger.warning(
-                        "related_to target %s not visible to caller %s; skipping edge",
-                        target_id, _caller_uid(),
-                    )
-                    continue
-                edge = MemoryEdge(
-                    source_id=node.id,
-                    target_id=uuid.UUID(target_id),
-                    type=EdgeType.CAUSED_BY,
-                    weight=0.7,
-                    created_by="user_explicit",
-                )
-                await self.graph.create_edge(edge)
+        # A correction edge first, so the F6 dedupe below never shadows it.
+        if v.supersedes is not None:
+            old_id, reason = v.supersedes
+            await self.graph.create_edge(MemoryEdge(
+                source_id=node.id,
+                target_id=uuid.UUID(old_id),
+                type=EdgeType.SUPERSEDES,
+                weight=1.0,
+                reason=reason,
+                created_by="user_explicit",
+            ))
+
+        # Explicit edges from related_to (legacy caused_by; targets pre-checked)
+        for target_id in v.related_to:
+            await self.graph.create_edge(MemoryEdge(
+                source_id=node.id,
+                target_id=uuid.UUID(target_id),
+                type=EdgeType.CAUSED_BY,
+                weight=0.7,
+                created_by="user_explicit",
+            ))
 
         # Typed explicit edges from `related` (writer-specified semantics)
-        if parsed_related:
-            for target_id, etype in parsed_related:
-                target_node = await self.graph.get_node(target_id)
-                if target_node is None:
-                    logger.warning(
-                        "related target %s not visible to caller %s; skipping edge",
-                        target_id, _caller_uid(),
-                    )
-                    continue
-                edge = MemoryEdge(
-                    source_id=node.id,
-                    target_id=uuid.UUID(target_id),
-                    type=etype,
-                    weight=0.7,
-                    created_by="user_explicit",
-                )
-                await self.graph.create_edge(edge)
+        for target_id, etype in v.related:
+            await self.graph.create_edge(MemoryEdge(
+                source_id=node.id,
+                target_id=uuid.UUID(target_id),
+                type=etype,
+                weight=0.7,
+                created_by="user_explicit",
+            ))
 
         # Auto-link to semantically similar existing memories
         possible_conflicts: list[dict[str, Any]] = []
@@ -296,6 +873,9 @@ class MCPToolHandler:
                 # The window is the max of the auto-link fan-out and the
                 # (wider) conflict-scan window.
                 scan_k = max(config.AUTOLINK_MAX_EDGES + 1, config.CONFLICT_SCAN_K)
+                # Scope is narrowed to the node's own scope (_narrow_scope): a
+                # space node only ever sees its space, a personal node personal
+                # + org, so candidates and conflict hints stay in scope (6.6).
                 similar = await self.graph.vector_search(
                     embedding, k=scan_k, org_ids=org_ids
                 )
@@ -304,6 +884,8 @@ class MCPToolHandler:
                     for other_node, score in similar:
                         if str(other_node.id) == node_id:
                             continue
+                        if other_node.space_id != v.space_id:
+                            continue  # belt and braces: never across a space boundary
                         if score < min_sim and score < conflict_min_sim:
                             continue
                         # Org boundary rule: org nodes only link to same-org nodes
@@ -354,14 +936,20 @@ class MCPToolHandler:
                 logger.warning("Auto-linking failed for node %s", node_id, exc_info=True)
 
         # Promote tagged → active if edges were formed (consolidation signal)
-        has_edges = related_to or parsed_related or not await self.graph.is_orphan(node_id)
+        has_edges = (
+            v.explicit_requested or v.supersedes is not None or not await self.graph.is_orphan(node_id)
+        )
         if has_edges:
             await self.graph.update_node(node_id, {"status": MemoryStatus.ACTIVE})
 
         if self.event_bus:
+            # Identity fields let a Redis-path worker rebuild the context (D10).
             await self.event_bus.publish("memory.created", {
                 "node_id": node_id,
                 "content_full": content,
+                "user_id": _caller_uid(),
+                "org_ids": list(current_org_ids.get([])),
+                "space_id": v.space_id,
             })
 
         await self._notify("memory.created", {"node_id": node_id, "content": content[:200]})
@@ -372,6 +960,7 @@ class MCPToolHandler:
 
     async def memory_amend(
         self, node_id: str, content: str, reason: str | None = None,
+        refs: list[dict[str, Any]] | None = None, tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Record a correction: create a new memory that supersedes an old one.
 
@@ -379,44 +968,66 @@ class MCPToolHandler:
         superseded hits by SUPERSEDED_DECAY and tags them ``superseded_by``, and
         the transitions engine demotes it naturally as it stops being recalled).
         Mutating status here would bypass that engine and be non-reversible.
+
+        ``refs``/``tags``: None copies the old memory's values; a list replaces
+        them exactly. The new node keeps the old node's space and external_id
+        (so an external_id follows the amendment).
         """
-        old = await self.graph.get_node(node_id)
-        if not old:
-            return {"error": "Node not found", "node_id": node_id}
-        if not _caller_owns_node(old):
-            return {"error": "Only the node owner can amend this memory"}
+        scope = await self._node_scope()
+        try:
+            old = await self.graph.get_node(node_id)
+            if not old:
+                return _not_found(node_id)
+            denied = await self._authorize_write(old, "Only the node owner can amend this memory")
+            if denied is not None:
+                return denied
+            result = await self._amend_node(old, content, reason, refs, tags)
+            if "error" in result:
+                return result
+            new_id = result["node_id"]
+            await self._notify("memory.amended", {"node_id": new_id, "supersedes": node_id})
+            return {"node_id": new_id, "supersedes": node_id, "status": "amended"}
+        finally:
+            scope.reset()
 
-        # Reuse the store hot path so the new node gets embedding + auto-link +
-        # eventing. Passing `related` also lets F6 dedupe suppress any parallel
-        # auto_link edge back to the old node.
-        store_result = await self.memory_store(
-            content,
+    async def _amend_node(
+        self,
+        old: MemoryNode,
+        content: str,
+        reason: str | None,
+        refs: list[Any] | None,
+        tags: list[Any] | None,
+    ) -> dict[str, Any]:
+        """Shared amend routine (memory_amend, on_existing="amend"; D08).
+
+        Authorization is the caller's job; this validates the new values and
+        writes the superseding node.
+        """
+        from papez.engine import config
+
+        if not isinstance(content, str) or not content.strip():
+            return _error("invalid_arguments", "content must be a non-empty string")
+        try:
+            new_refs = list(old.refs) if refs is None else validate_refs(refs, max_refs=config.MAX_REFS_PER_MEMORY)
+            new_tags = list(old.tags) if tags is None else normalize_tags(
+                tags, max_tag_length=config.MAX_TAG_LENGTH, max_tags=config.MAX_TAGS_PER_MEMORY,
+            )
+        except ValidationFailure as exc:
+            return exc.as_error()
+        space_id = old.space_id
+        return await self._write_memory(_Validated(
+            content=content,
             source_session=old.source_session,
+            visibility=Visibility.PRIVATE if space_id is not None else old.visibility,
+            org_id=None if space_id is not None else old.org_id,
             category=old.category,
-            related=[{"id": node_id, "type": EdgeType.SUPERSEDES.value}],
-            visibility=old.visibility.value,
-            org_id=old.org_id,
-        )
-        if "error" in store_result:
-            return store_result
-        new_id = store_result["node_id"]
-
-        # Upgrade the supersedes edge to a full-strength, reasoned correction.
-        # No field-level edge mutator exists on the Protocol, so recreate it.
-        for e in await self.graph.get_edges(new_id, "out", EdgeType.SUPERSEDES):
-            if str(e.target_id) == node_id:
-                await self.graph.delete_edge(str(e.id))
-        await self.graph.create_edge(MemoryEdge(
-            source_id=uuid.UUID(new_id),
-            target_id=uuid.UUID(node_id),
-            type=EdgeType.SUPERSEDES,
-            weight=1.0,
-            reason=reason or "amended",
-            created_by="user_explicit",
+            refs=new_refs,
+            tags=new_tags,
+            space_id=space_id,
+            created_at=datetime.now(UTC),
+            external_id=old.external_id,
+            supersedes=(str(old.id), reason or "amended"),
         ))
-
-        await self._notify("memory.amended", {"node_id": new_id, "supersedes": node_id})
-        return {"node_id": new_id, "supersedes": node_id, "status": "amended"}
 
     async def memory_recall(
         self,
@@ -426,6 +1037,53 @@ class MCPToolHandler:
         read_only: bool = False,
         verbosity: str = "full",
         min_results: int | None = None,
+        tags_any: list[str] | None = None,
+        ref_type: str | None = None,
+        space: str | None = None,
+        spaces: list[str] | None = None,
+        include_personal: bool | None = None,
+    ) -> dict[str, Any]:
+        """Recall memories by hybrid search; see ``_recall`` for the ranking.
+
+        Scope (spec 6.5/7.4): ``space``/``spaces`` limit the call to named
+        spaces (personal memory then only with ``include_personal=True``);
+        with neither, every non-archived membership plus personal memory.
+        ``tags_any``/``ref_type`` filter candidates BEFORE ranking (storage
+        level), so ``k`` matching results still come back.
+        """
+        from papez.engine import config
+
+        try:
+            norm_tags = normalize_tags(
+                tags_any, max_tag_length=config.MAX_TAG_LENGTH, max_tags=config.MAX_TAGS_PER_MEMORY,
+            ) if tags_any is not None else []
+        except ValidationFailure as exc:
+            return exc.as_error()
+        if ref_type is not None and not isinstance(ref_type, str):
+            return _error("invalid_arguments", "ref_type must be a string")
+        scope = await self._resolve_scope(space, spaces, include_personal, None, "memberships")
+        if scope.error is not None:
+            return scope.error
+        try:
+            return await self._recall(
+                query, k, max_results, read_only, verbosity, min_results,
+                tags_any=norm_tags or None, ref_type=ref_type or None, labels=scope.spaces,
+            )
+        finally:
+            scope.reset()
+
+    async def _recall(
+        self,
+        query: str,
+        k: int = 10,
+        max_results: int | None = None,
+        read_only: bool = False,
+        verbosity: str = "full",
+        min_results: int | None = None,
+        *,
+        tags_any: list[str] | None = None,
+        ref_type: str | None = None,
+        labels: dict[str, Space] | None = None,
     ) -> dict[str, Any]:
         """Recall memories by hybrid search: vector + keyword, ranked by vector similarity.
 
@@ -486,7 +1144,14 @@ class MCPToolHandler:
             search_terms = list(dict.fromkeys(_stem_plural(t) for t in _raw_terms if t))
         else:
             search_terms = _raw_terms
-        kw_coros = [self.graph.keyword_search(t, k=k, org_ids=org_ids) for t in search_terms]
+        # Storage-level filters (D09): only passed when set, so providers that
+        # predate them keep working for unfiltered recall.
+        search_filters: dict[str, Any] = {}
+        if tags_any:
+            search_filters["tags_any"] = tags_any
+        if ref_type:
+            search_filters["ref_type"] = ref_type
+        kw_coros = [self.graph.keyword_search(t, k=k, org_ids=org_ids, **search_filters) for t in search_terms]
         if self.embeddings:
             embed_and_kw: list[Any] = await asyncio.gather(self.embeddings.embed(query), *kw_coros)
             embedding: list[float] = embed_and_kw[0]
@@ -498,7 +1163,9 @@ class MCPToolHandler:
         # 1. Vector search (needs embedding)
         min_sim = engine_config.resolve_recall_min_similarity(self.embeddings)
 
-        vector_results = await self.graph.vector_search(embedding, k=k, org_ids=org_ids) if embedding else []
+        vector_results = (
+            await self.graph.vector_search(embedding, k=k, org_ids=org_ids, **search_filters) if embedding else []
+        )
 
         # 2. Collect keyword hits. kw_coverage[nid] = how many distinct query
         # terms matched this node — the lexical-relevance signal I3-2's RRF ranks
@@ -605,7 +1272,7 @@ class MCPToolHandler:
         for nid, info in merged.items():
             node = info["node"]
             node_by_id[nid] = node
-            mem = self._format_memory_light(node, info["vec_score"])
+            mem = self._format_memory_light(node, info["vec_score"], labels)
             if info.get("low_confidence"):
                 mem["low_confidence"] = True
             if _rrf_on:
@@ -633,6 +1300,8 @@ class MCPToolHandler:
         core_candidates: list[tuple[MemoryNode, float]] = []
         for cnode in core_nodes:
             cid = str(cnode.id)
+            if not _matches_tags_and_ref_type(cnode, tags_any, ref_type):
+                continue  # the pinned/core injection honours the same filters
             if cid not in seen_ids:
                 core_sim = 0.0
                 if cnode.embedding and embedding:
@@ -643,7 +1312,7 @@ class MCPToolHandler:
         for cnode, core_sim in core_candidates[:10]:
             cid = str(cnode.id)
             node_by_id[cid] = cnode
-            mem = self._format_memory_light(cnode, core_sim)
+            mem = self._format_memory_light(cnode, core_sim, labels)
             mem["is_core"] = True
             mem["_rank_score"] = core_sim
             memories.append(mem)
@@ -830,6 +1499,9 @@ class MCPToolHandler:
                     "score": mem.get("score"),
                     "activation": mem.get("activation"),
                     "is_core": mem.get("is_core", False),
+                    "tags": mem.get("tags", []),
+                    "ref_count": len(mem.get("refs", [])),
+                    "space": mem.get("space"),
                 }
                 if "superseded_by" in mem:
                     c["superseded_by"] = mem["superseded_by"]
@@ -840,7 +1512,9 @@ class MCPToolHandler:
 
         return {"query": query, "results": memories, "count": len(memories)}
 
-    def _format_memory_light(self, node: MemoryNode, score: float) -> dict[str, Any]:
+    def _format_memory_light(
+        self, node: MemoryNode, score: float, labels: dict[str, Space] | None = None,
+    ) -> dict[str, Any]:
         """Format a memory node without causal chain queries (for ranking phase)."""
         return {
             "id": str(node.id),
@@ -856,35 +1530,10 @@ class MCPToolHandler:
             "created_at": node.created_at.isoformat(),
             "causal_basis": [],
             "is_core": node.status == MemoryStatus.CORE,
+            "refs": [_ref_dump(r) for r in node.refs],
+            "tags": list(node.tags),
+            "space": self._space_label(node.space_id, labels),
         }
-
-    async def _format_memory(self, node: MemoryNode, score: float) -> dict[str, Any]:
-        """Format a memory node with causal chain info."""
-        result = self._format_memory_light(node, score)
-        org_ids = current_org_ids.get([])
-        try:
-            upstream = await self.graph.get_causal_chain(str(node.id), "upstream", org_ids=org_ids)
-            downstream = await self.graph.get_causal_chain(str(node.id), "downstream", org_ids=org_ids)
-            causal_basis = []
-            seen = set()
-            for n in upstream[:5]:
-                if str(n.id) not in seen:
-                    causal_basis.append({"id": str(n.id), "summary": n.content_summary, "direction": "upstream"})
-                    seen.add(str(n.id))
-            for n in downstream[:5]:
-                if str(n.id) not in seen:
-                    causal_basis.append({"id": str(n.id), "summary": n.content_summary, "direction": "downstream"})
-                    seen.add(str(n.id))
-            result["causal_basis"] = causal_basis
-            if upstream:
-                causal_chain = []
-                for n in reversed(upstream[:5]):
-                    causal_chain.append({"id": str(n.id), "summary": n.content_summary})
-                causal_chain.append({"id": str(node.id), "summary": node.content_summary})
-                result["causal_chain"] = causal_chain
-        except Exception:
-            logger.warning("Causal chain formatting failed for node %s", node.id, exc_info=True)
-        return result
 
     @staticmethod
     def _node_passes_filters(node: MemoryNode, filters: dict[str, Any] | None) -> bool:
@@ -908,10 +1557,28 @@ class MCPToolHandler:
             active_dt = _parse_iso_utc(filters["active_since"])
             if node.last_reactivated_at < active_dt:
                 return False
+        # Tag filters expect values already normalized (memory_search does it).
+        tags_any = filters.get("tags_any")
+        if tags_any and not set(tags_any).intersection(node.tags):
+            return False
+        tags_all = filters.get("tags_all")
+        if tags_all and not set(tags_all).issubset(node.tags):
+            return False
+        ref_type = filters.get("ref_type")
+        ref_id = filters.get("ref_id")
+        if ref_type or ref_id:
+            # Combined, both must match on the SAME ref (spec 5.4).
+            if not any(
+                (not ref_type or r.type == ref_type) and (not ref_id or r.id == ref_id)
+                for r in node.refs
+            ):
+                return False
         return True
 
     @staticmethod
-    def _format_search_hit(node: MemoryNode, score: float) -> dict[str, Any]:
+    def _format_search_hit(
+        node: MemoryNode, score: float, labels: dict[str, Space] | None = None,
+    ) -> dict[str, Any]:
         return {
             "id": str(node.id),
             "summary": node.content_summary,
@@ -924,6 +1591,9 @@ class MCPToolHandler:
             # carry where and when a memory last moved.
             "last_reactivated_at": node.last_reactivated_at.isoformat(),
             "source_session": node.source_session,
+            "refs": [_ref_dump(r) for r in node.refs],
+            "tags": list(node.tags),
+            "space": MCPToolHandler._space_label(node.space_id, labels),
         }
 
     async def memory_search(
@@ -931,8 +1601,42 @@ class MCPToolHandler:
         query: str,
         filters: dict[str, Any] | None = None,
         k: int = 10,
+        space: str | None = None,
+        spaces: list[str] | None = None,
+        include_personal: bool | None = None,
     ) -> dict[str, Any]:
-        """Filtered vector search by status/category/date/entity.
+        """Filtered search; scope as in ``memory_recall`` (spec 6.7)."""
+        from papez.engine import config
+
+        if filters is not None and not isinstance(filters, dict):
+            return _error("invalid_arguments", "filters must be an object")
+        if filters:
+            filters = dict(filters)
+            try:
+                for key in ("tags_any", "tags_all"):
+                    if filters.get(key) is not None:
+                        filters[key] = normalize_tags(
+                            filters[key], max_tag_length=config.MAX_TAG_LENGTH,
+                            max_tags=config.MAX_TAGS_PER_MEMORY,
+                        )
+            except ValidationFailure as exc:
+                return exc.as_error()
+        scope = await self._resolve_scope(space, spaces, include_personal, None, "memberships")
+        if scope.error is not None:
+            return scope.error
+        try:
+            return await self._search(query, filters, k, scope.spaces)
+        finally:
+            scope.reset()
+
+    async def _search(
+        self,
+        query: str,
+        filters: dict[str, Any] | None,
+        k: int,
+        labels: dict[str, Space] | None,
+    ) -> dict[str, Any]:
+        """Filtered vector search by status/category/date/entity/tags/refs.
 
         Enumeration mode (F8): an EMPTY ``query`` skips vector search entirely
         and lists memories by recency (``last_reactivated_at`` descending),
@@ -954,7 +1658,7 @@ class MCPToolHandler:
                     nodes_by_id[str(node.id)] = node
             filtered = [n for n in nodes_by_id.values() if self._node_passes_filters(n, filters)]
             filtered.sort(key=lambda n: n.last_reactivated_at, reverse=True)
-            memories = [self._format_search_hit(n, 0.0) for n in filtered[:k]]
+            memories = [self._format_search_hit(n, 0.0, labels) for n in filtered[:k]]
             await self._tag_superseded(memories)
             return {"query": query, "results": memories, "count": len(memories)}
 
@@ -962,14 +1666,22 @@ class MCPToolHandler:
             return {"query": query, "results": [], "count": 0}
         embedding = await self.embeddings.embed(query)
 
-        results = await self.graph.vector_search(embedding, k=k, status_filter=status_filter)
+        # Post-query filters would otherwise shrink a k-limited result set, so
+        # over-fetch (k*4, capped at 400) when any are present (D09) and cut to
+        # k afterwards; the enumeration path already filters before its cut.
+        post_filter_keys = {"category", "entity", "since", "active_since", "tags_any", "tags_all", "ref_type", "ref_id"}
+        has_post_filters = bool(filters) and any(key in post_filter_keys for key in (filters or {}))
+        fetch_k = max(k, min(k * 4, 400)) if has_post_filters else k
+        results = await self.graph.vector_search(embedding, k=fetch_k, status_filter=status_filter)
 
         # Apply additional filters post-query
         memories = []
         for node, score in results:
             if not self._node_passes_filters(node, filters):
                 continue
-            memories.append(self._format_search_hit(node, score))
+            memories.append(self._format_search_hit(node, score, labels))
+            if len(memories) >= k:
+                break
 
         await self._tag_superseded(memories)
         return {"query": query, "results": memories, "count": len(memories)}
@@ -1000,8 +1712,30 @@ class MCPToolHandler:
         node_id: str,
         depth: int = 2,
         edge_types: list[str] | None = None,
+        space: str | None = None,
+        spaces: list[str] | None = None,
+        include_personal: bool | None = None,
     ) -> dict[str, Any]:
-        """Subgraph traversal returning connected nodes."""
+        """Subgraph traversal returning connected nodes, within the call's scope.
+
+        A start node outside the scope (or missing) returns ``not_found``.
+        """
+        scope = await self._resolve_scope(space, spaces, include_personal, None, "memberships")
+        if scope.error is not None:
+            return scope.error
+        try:
+            if await self.graph.get_node(node_id) is None:
+                return _not_found(node_id)
+            return await self._traverse(node_id, depth, edge_types)
+        finally:
+            scope.reset()
+
+    async def _traverse(
+        self,
+        node_id: str,
+        depth: int = 2,
+        edge_types: list[str] | None = None,
+    ) -> dict[str, Any]:
         MAX_DEPTH = 10
         if depth > MAX_DEPTH:
             logger.info("memory_traverse depth=%d capped to %d", depth, MAX_DEPTH)
@@ -1069,10 +1803,21 @@ class MCPToolHandler:
         }
 
     async def memory_explain(self, node_id: str) -> dict[str, Any]:
-        """Score breakdown, causal basis, and removal impact for a memory."""
+        """Score breakdown, causal basis, and removal impact for a memory.
+
+        Uses the caller's full (non-archived) membership scope; anything not
+        visible is ``not_found``.
+        """
+        scope = await self._node_scope(include_archived=False)
+        try:
+            return await self._explain(node_id, scope.spaces)
+        finally:
+            scope.reset()
+
+    async def _explain(self, node_id: str, labels: dict[str, Space]) -> dict[str, Any]:
         node = await self.graph.get_node(node_id)
         if not node:
-            return {"error": "Node not found", "node_id": node_id}
+            return _not_found(node_id)
 
         causal_weight = await self.graph.get_causal_weight(node_id)
         is_orphan = await self.graph.is_orphan(node_id)
@@ -1136,6 +1881,9 @@ class MCPToolHandler:
             "reactivation_count": node.reactivation_count,
             "reactivation_pattern": node.reactivation_pattern.value,
             "pinned": node.pinned,
+            "refs": [_ref_dump(r) for r in node.refs],
+            "tags": list(node.tags),
+            "space": self._space_label(node.space_id, labels),
             "is_orphan": is_orphan,
             "upstream_count": len(upstream),
             "downstream_count": len(downstream),
@@ -1162,51 +1910,69 @@ class MCPToolHandler:
         }
 
     async def pin_memory(self, node_id: str) -> dict[str, Any]:
-        """Pin a memory to core status."""
-        node = await self.graph.get_node(node_id)
-        if not node:
-            return {"error": "Node not found", "node_id": node_id}
-        if not _caller_owns_node(node):
-            return {"error": "Only the node owner can pin this memory"}
+        """Pin a memory to core status (space nodes: writer or owner)."""
+        scope = await self._node_scope()
+        try:
+            node = await self.graph.get_node(node_id)
+            if not node:
+                return _not_found(node_id)
+            denied = await self._authorize_write(node, "Only the node owner can pin this memory")
+            if denied is not None:
+                return denied
 
-        await self.graph.update_node(node_id, {
-            "pinned": True,
-            "status": MemoryStatus.CORE,
-            "promotion_reason": "user_pinned",
-        })
-        await self._notify("memory.pinned", {"node_id": node_id})
-        return {"node_id": node_id, "status": "pinned", "new_status": "core"}
+            await self.graph.update_node(node_id, {
+                "pinned": True,
+                "status": MemoryStatus.CORE,
+                "promotion_reason": "user_pinned",
+            })
+            await self._notify("memory.pinned", {"node_id": node_id})
+            return {"node_id": node_id, "status": "pinned", "new_status": "core"}
+        finally:
+            scope.reset()
 
     async def unpin_memory(self, node_id: str) -> dict[str, Any]:
-        """Unpin a memory and re-evaluate core eligibility."""
-        node = await self.graph.get_node(node_id)
-        if not node:
-            return {"error": "Node not found", "node_id": node_id}
-        if not _caller_owns_node(node):
-            return {"error": "Only the node owner can unpin this memory"}
+        """Unpin a memory and re-evaluate core eligibility (space nodes: writer or owner)."""
+        scope = await self._node_scope()
+        try:
+            node = await self.graph.get_node(node_id)
+            if not node:
+                return _not_found(node_id)
+            denied = await self._authorize_write(node, "Only the node owner can unpin this memory")
+            if denied is not None:
+                return denied
 
-        await self.graph.update_node(node_id, {"pinned": False})
+            await self.graph.update_node(node_id, {"pinned": False})
 
-        # Re-evaluate: refresh node after unpin
-        refreshed = await self.graph.get_node(node_id)
-        if not refreshed:
-            return {"node_id": node_id, "status": "unpinned", "new_status": "unknown"}
-        should_stay_core, reason = await evaluate_core_promotion(refreshed, self.graph)
+            # Re-evaluate: refresh node after unpin, inside the node's own scope
+            # so core promotion counts only that scope's edges.
+            with self._narrow_scope(node.space_id):
+                refreshed = await self.graph.get_node(node_id)
+                if not refreshed:
+                    return {"node_id": node_id, "status": "unpinned", "new_status": "unknown"}
+                should_stay_core, reason = await evaluate_core_promotion(refreshed, self.graph)
 
-        if not should_stay_core:
-            await self.graph.update_node(node_id, {
-                "status": MemoryStatus.ACTIVE,
-                "promotion_reason": None,
-            })
-            await self._notify("memory.unpinned", {"node_id": node_id, "new_status": "active"})
-            return {"node_id": node_id, "status": "unpinned", "new_status": "active"}
+            if not should_stay_core:
+                await self.graph.update_node(node_id, {
+                    "status": MemoryStatus.ACTIVE,
+                    "promotion_reason": None,
+                })
+                await self._notify("memory.unpinned", {"node_id": node_id, "new_status": "active"})
+                return {"node_id": node_id, "status": "unpinned", "new_status": "active"}
 
-        await self._notify("memory.unpinned", {"node_id": node_id, "new_status": "core"})
-        return {"node_id": node_id, "status": "unpinned", "new_status": "core", "reason": reason}
+            await self._notify("memory.unpinned", {"node_id": node_id, "new_status": "core"})
+            return {"node_id": node_id, "status": "unpinned", "new_status": "core", "reason": reason}
+        finally:
+            scope.reset()
 
-    async def list_core_memories(self, category: str | None = None) -> dict[str, Any]:
-        """List all core memories, optionally filtered by category."""
-        nodes = await self.graph.get_nodes_by_status(MemoryStatus.CORE, limit=500)
+    async def list_core_memories(self, category: str | None = None, space: str | None = None) -> dict[str, Any]:
+        """List core memories (personal by default, or one space's), optionally by category."""
+        scope = await self._resolve_scope(space, None, None, None, "personal")
+        if scope.error is not None:
+            return scope.error
+        try:
+            nodes = await self.graph.get_nodes_by_status(MemoryStatus.CORE, limit=500)
+        finally:
+            scope.reset()
 
         if category:
             nodes = [n for n in nodes if n.category == category]
@@ -1223,6 +1989,8 @@ class MCPToolHandler:
                 "pinned": n.pinned,
                 "promotion_reason": n.promotion_reason,
                 "created_at": n.created_at.isoformat(),
+                "tags": list(n.tags),
+                "space": self._space_label(n.space_id, scope.spaces),
             }
             for n in nodes
         ]
@@ -1230,20 +1998,31 @@ class MCPToolHandler:
         return {"core_memories": memories, "count": len(memories)}
 
     async def delete_memory(self, node_id: str) -> dict[str, Any]:
-        """Hard delete a memory node and all its edges."""
-        node = await self.graph.get_node(node_id)
-        if not node:
-            return {"error": "Node not found", "node_id": node_id}
-        if not _caller_owns_node(node):
-            return {"error": "Only the node owner can delete this memory"}
+        """Hard delete a memory node and all its edges (space nodes: writer or owner)."""
+        scope = await self._node_scope()
+        try:
+            node = await self.graph.get_node(node_id)
+            if not node:
+                return _not_found(node_id)
+            denied = await self._authorize_write(node, "Only the node owner can delete this memory")
+            if denied is not None:
+                return denied
 
-        await self.graph.delete_node(node_id)
-        await self._notify("memory.deleted", {"node_id": node_id})
-        return {"node_id": node_id, "status": "deleted"}
+            await self.graph.delete_node(node_id)
+            await self._notify("memory.deleted", {"node_id": node_id})
+            return {"node_id": node_id, "status": "deleted"}
+        finally:
+            scope.reset()
 
-    async def memory_stats(self) -> dict[str, Any]:
-        """Return graph statistics."""
-        stats = await self.graph.get_stats()
+    async def memory_stats(self, space: str | None = None) -> dict[str, Any]:
+        """Return graph statistics: personal by default, or one space (reader+)."""
+        scope = await self._resolve_scope(space, None, None, None, "personal")
+        if scope.error is not None:
+            return scope.error
+        try:
+            stats = await self.graph.get_stats()
+        finally:
+            scope.reset()
         return stats
 
     async def set_core_preferences(
@@ -1271,10 +2050,21 @@ class MCPToolHandler:
                 "promote_all" — also promote directly linked private nodes (1 level deep).
                 "delete_links" — remove edges to private nodes before promoting.
             dry_run: If True, return a preview of what would change without applying it.
+
+        Space memories can't be promoted to org (``invalid_arguments``).
         """
+        scope = await self._node_scope()
+        try:
+            return await self._promote_to_org(node_id, org_id, action, dry_run)
+        finally:
+            scope.reset()
+
+    async def _promote_to_org(self, node_id: str, org_id: str, action: str, dry_run: bool) -> dict[str, Any]:
         node = await self.graph.get_node(node_id)
         if not node:
-            return {"error": "Node not found", "node_id": node_id}
+            return _not_found(node_id)
+        if node.space_id is not None:
+            return _error("invalid_arguments", "space memories can't be promoted to org", node_id=node_id)
         if node.visibility == Visibility.ORG:
             return {"error": "Already org-visible", "node_id": node_id}
         if org_id not in current_org_ids.get([]):
@@ -1379,9 +2169,388 @@ class MCPToolHandler:
 
         manifest = await self.graph.erase_user(user_id, keep_promoted_nodes=keep_promoted_nodes)
         await self.cache.delete(f"core_preferences:{user_id}")
-        await self._notify("user.erased", {"user_id": user_id, "manifest": manifest})
-        return {
+        result: dict[str, Any] = {
             "status": "erased",
             "user_id": user_id,
             **manifest,
         }
+        if self.spaces is not None:
+            # D32: drop the user's memberships, except where they are the last
+            # user owner (left in place and reported, so the space stays owned).
+            still_owned: list[str] = []
+            for space, _role in await self.spaces.list_spaces_for_principal(user_id, include_archived=True):
+                try:
+                    await self.spaces.remove_member(space.id, user_id)
+                except ValueError as exc:
+                    if str(exc) == "last_owner":
+                        still_owned.append(space.id)
+                        logger.warning("erase_user: %s is the last owner of space %s", user_id, space.id)
+                    else:
+                        raise
+            result["spaces_still_owned"] = still_owned
+        await self._notify("user.erased", {"user_id": user_id, "manifest": manifest})
+        return result
+
+    # -- Mind Spaces tools (spec 6.8) ---------------------------------------------
+
+    @staticmethod
+    def _space_dict(space: Space, role: Any = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "id": space.id,
+            "slug": space.slug,
+            "name": space.name,
+            "org_id": space.org_id,
+            "description": space.description,
+            "forgetting_policy": _role_value(space.forgetting_policy),
+            "llm_inference_enabled": space.llm_inference_enabled,
+            "archived": space.archived,
+            "archived_at": space.archived_at.isoformat() if space.archived_at else None,
+            "created_at": space.created_at.isoformat(),
+            "created_by": space.created_by,
+        }
+        if role is not None:
+            out["your_role"] = _role_value(role)
+        return out
+
+    @staticmethod
+    def _member_dict(member: SpaceMember) -> dict[str, Any]:
+        return {
+            "principal_id": member.principal_id,
+            "principal_type": _role_value(member.principal_type),
+            "role": _role_value(member.role),
+            "added_by": member.added_by,
+            "added_at": member.added_at.isoformat(),
+        }
+
+    def _registry_error(self) -> dict[str, Any] | None:
+        if self.spaces is None:
+            return _error("invalid_arguments", "Mind Spaces are not available on this server")
+        return None
+
+    async def _memory_count(self, space_id: str) -> int:
+        with self._narrow_scope(space_id):
+            stats = await self.graph.get_stats()
+        return int(stats.get("nodes", stats.get("total_nodes", 0)) or 0)
+
+    async def _space_with_counts(self, space: Space, role: Any) -> dict[str, Any]:
+        assert self.spaces is not None
+        out = self._space_dict(space, role)
+        out["member_count"] = await self.spaces.count_members(space.id)
+        out["memory_count"] = await self._memory_count(space.id)
+        return out
+
+    async def _space_for(
+        self, space: str, need_role: SpaceRole, *, allow_archived: bool | None = None,
+    ) -> tuple[Space, str] | dict[str, Any]:
+        """Resolve ``space`` for a space-management tool; returns (Space, role) or an error."""
+        missing = self._registry_error()
+        if missing is not None:
+            return missing
+        if not isinstance(space, str) or not space:
+            return _space_not_found()
+        scope = await self._resolve_scope(space, None, None, need_role, allow_archived=allow_archived)
+        scope.reset()  # management tools read the registry, not the graph scope
+        if scope.error is not None:
+            return scope.error
+        sid = scope.space_ids[0]
+        found = scope.spaces.get(sid)
+        if found is None:
+            return _space_not_found()
+        return found, scope.roles.get(sid, need_role.value)
+
+    async def space_create(
+        self,
+        name: str,
+        slug: str | None = None,
+        org_id: str | None = None,
+        description: str | None = None,
+        forgetting_policy: str = "retain_all",
+        llm_inference_enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Create a space; the caller becomes its first owner. Users only."""
+        from papez.storage.spaces import unique_slug
+
+        missing = self._registry_error()
+        if missing is not None:
+            return missing
+        assert self.spaces is not None
+        uid = _caller_uid()
+        if uid is None:
+            raise PermissionError("current_user_id not set — cannot create a space")
+        if _is_service():
+            return _error("insufficient_role", "Service principals can't create spaces")
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            return _error("invalid_arguments", "name must be 1-120 characters")
+        orgs = list(current_org_ids.get([]))
+        if org_id is not None:
+            if org_id not in orgs:
+                return _error("invalid_arguments", "org_id not in caller's org memberships")
+        elif len(orgs) == 1:
+            org_id = orgs[0]
+        elif not orgs:
+            return _error("invalid_arguments", "You need to belong to an org to create a space")
+        else:
+            return _error("invalid_arguments", "You belong to several orgs; pass org_id")
+        try:
+            policy = ForgettingPolicy(forgetting_policy)
+        except ValueError:
+            return _error("invalid_arguments", "forgetting_policy must be 'retain_all' or 'standard'")
+        if not isinstance(llm_inference_enabled, bool):
+            return _error("invalid_arguments", "llm_inference_enabled must be a boolean")
+        if slug is not None:
+            if not isinstance(slug, str) or not _SLUG_RE.match(slug):
+                return _error("invalid_arguments", "slug must match ^[a-z0-9][a-z0-9-]{1,62}$")
+            final_slug = slug
+        else:
+            taken_fn = getattr(self.spaces, "slugs_for_org", None)
+            if taken_fn is not None:
+                taken = set(taken_fn(org_id))
+            else:
+                taken = {s.slug for s in await self.spaces.list_spaces_for_org(org_id, include_archived=True)}
+            final_slug = unique_slug(name, taken)
+        try:
+            new_space = Space(
+                org_id=org_id,
+                name=name,
+                slug=final_slug,
+                description=description,
+                forgetting_policy=policy,
+                llm_inference_enabled=llm_inference_enabled,
+                created_by=uid,
+            )
+        except Exception as exc:  # pydantic ValidationError
+            return _error("invalid_arguments", f"invalid space: {exc.__class__.__name__}")
+        try:
+            async with self._atomic():
+                created = await self.spaces.create_space(new_space)
+                await self.spaces.add_member(SpaceMember(
+                    space_id=created.id,
+                    principal_id=uid,
+                    principal_type=PrincipalType.USER,
+                    role=SpaceRole.OWNER,
+                    added_by=uid,
+                ))
+        except ValueError as exc:
+            if str(exc) == "slug_taken":
+                return _error("slug_taken", "That slug is already used in this org")
+            return _error("invalid_arguments", "invalid space")
+        return {"space": self._space_dict(created, SpaceRole.OWNER)}
+
+    async def space_list(self, include_archived: bool = False) -> dict[str, Any]:
+        """Spaces the caller is a member of, sorted by name."""
+        missing = self._registry_error()
+        if missing is not None:
+            return missing
+        assert self.spaces is not None
+        uid = _caller_uid()
+        if uid is None:
+            raise PermissionError("current_user_id not set — cannot list spaces")
+        pairs = await self.spaces.list_spaces_for_principal(uid, include_archived=bool(include_archived))
+        items = [await self._space_with_counts(space, role) for space, role in pairs]
+        items.sort(key=lambda d: (str(d["name"]).lower(), d["id"]))
+        return {"spaces": items}
+
+    async def space_get(self, space: str) -> dict[str, Any]:
+        """One space with member and memory counts (reader+)."""
+        hit = await self._space_for(space, SpaceRole.READER)
+        if isinstance(hit, dict):
+            return hit
+        found, role = hit
+        return {"space": await self._space_with_counts(found, role)}
+
+    async def space_update(
+        self,
+        space: str,
+        name: str | None = None,
+        description: str | None = None,
+        forgetting_policy: str | None = None,
+        llm_inference_enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        """Change name/description/policies (owner). The slug never changes."""
+        hit = await self._space_for(space, SpaceRole.OWNER)
+        if isinstance(hit, dict):
+            return hit
+        found, role = hit
+        assert self.spaces is not None
+        updates: dict[str, Any] = {}
+        if name is not None:
+            if not isinstance(name, str) or not name.strip() or len(name) > 120:
+                return _error("invalid_arguments", "name must be 1-120 characters")
+            updates["name"] = name
+        if description is not None:
+            updates["description"] = description
+        if forgetting_policy is not None:
+            try:
+                updates["forgetting_policy"] = ForgettingPolicy(forgetting_policy)
+            except ValueError:
+                return _error("invalid_arguments", "forgetting_policy must be 'retain_all' or 'standard'")
+        if llm_inference_enabled is not None:
+            if not isinstance(llm_inference_enabled, bool):
+                return _error("invalid_arguments", "llm_inference_enabled must be a boolean")
+            updates["llm_inference_enabled"] = llm_inference_enabled
+        if not updates:
+            return {"space": self._space_dict(found, role)}
+        try:
+            updated = await self.spaces.update_space(found.id, updates)
+        except ValueError:
+            return _error("invalid_arguments", "invalid space update")
+        return {"space": self._space_dict(updated, role)}
+
+    async def space_member_add(
+        self, space: str, principal_id: str, principal_type: str, role: str,
+    ) -> dict[str, Any]:
+        """Add a member or change their role (owner)."""
+        hit = await self._space_for(space, SpaceRole.OWNER)
+        if isinstance(hit, dict):
+            return hit
+        found, _ = hit
+        assert self.spaces is not None
+        if not isinstance(principal_id, str) or not principal_id:
+            return _error("invalid_arguments", "principal_id is required")
+        try:
+            ptype = PrincipalType(principal_type)
+            new_role = SpaceRole(role)
+        except ValueError:
+            return _error("invalid_arguments", "principal_type must be user|service and role owner|writer|reader")
+        if ptype == PrincipalType.SERVICE and new_role == SpaceRole.OWNER:
+            return _error("invalid_arguments", "A service principal can't be an owner")
+        if ptype == PrincipalType.USER and self.principal_in_org is not None:
+            if not await self.principal_in_org(found.org_id, principal_id):
+                return _error("principal_not_in_org", "That user doesn't belong to the space's org")
+        uid = _caller_uid() or ""
+        existing = None
+        getter = getattr(self.spaces, "get_member", None)
+        if getter is not None:
+            existing = await getter(found.id, principal_id)
+        else:
+            existing = next((m for m in await self.spaces.list_members(found.id) if m.principal_id == principal_id), None)
+        try:
+            member = await self.spaces.add_member(SpaceMember(
+                space_id=found.id,
+                principal_id=principal_id,
+                principal_type=ptype,
+                role=new_role,
+                added_by=uid,
+            ))
+        except ValueError as exc:
+            if str(exc) == "last_owner":
+                return _error("last_owner", "A space must keep at least one user owner")
+            return _error("invalid_arguments", "invalid member")
+        return {"member": self._member_dict(member), "created": existing is None}
+
+    async def space_member_remove(self, space: str, principal_id: str) -> dict[str, Any]:
+        """Remove a member (owner). Takes effect on their next request."""
+        hit = await self._space_for(space, SpaceRole.OWNER)
+        if isinstance(hit, dict):
+            return hit
+        found, _ = hit
+        assert self.spaces is not None
+        try:
+            await self.spaces.remove_member(found.id, principal_id)
+        except ValueError as exc:
+            if str(exc) == "last_owner":
+                return _error("last_owner", "A space must keep at least one user owner")
+            return _space_not_found()
+        return {"removed": True}
+
+    async def space_member_list(self, space: str) -> dict[str, Any]:
+        """Members of a space (reader+)."""
+        hit = await self._space_for(space, SpaceRole.READER)
+        if isinstance(hit, dict):
+            return hit
+        found, _ = hit
+        assert self.spaces is not None
+        return {"members": [self._member_dict(m) for m in await self.spaces.list_members(found.id)]}
+
+    async def space_archive(self, space: str) -> dict[str, Any]:
+        """Archive a space (owner): read-only, out of default recall."""
+        hit = await self._space_for(space, SpaceRole.OWNER)
+        if isinstance(hit, dict):
+            return hit
+        found, role = hit
+        assert self.spaces is not None
+        updated = await self.spaces.update_space(found.id, {"archived_at": datetime.now(UTC)})
+        return {"space": self._space_dict(updated, role)}
+
+    async def space_unarchive(self, space: str) -> dict[str, Any]:
+        """Unarchive a space (owner)."""
+        hit = await self._space_for(space, SpaceRole.OWNER, allow_archived=True)
+        if isinstance(hit, dict):
+            return hit
+        found, role = hit
+        assert self.spaces is not None
+        if not found.archived:
+            return {"space": self._space_dict(found, role)}
+        updated = await self.spaces.update_space(found.id, {"archived_at": None})
+        return {"space": self._space_dict(updated, role)}
+
+    async def space_erase(self, space: str, confirm_slug: str, dry_run: bool = False) -> dict[str, Any]:
+        """Permanently delete a space, its memories, edges and memberships (owner).
+
+        ``confirm_slug`` must equal the slug. ``dry_run`` reports the counts
+        and deletes nothing. The id is never reused; audit rows are kept.
+        """
+        hit = await self._space_for(space, SpaceRole.OWNER, allow_archived=True)
+        if isinstance(hit, dict):
+            return hit
+        found, _ = hit
+        assert self.spaces is not None
+        if confirm_slug != found.slug:
+            return _error("confirmation_mismatch", "confirm_slug doesn't match the space's slug")
+        members = await self.spaces.count_members(found.id)
+        if dry_run:
+            counts = await self.graph.erase_space(found.id, dry_run=True)
+            return {"erased": {"space_id": found.id, "nodes": counts.get("nodes", 0),
+                               "edges": counts.get("edges", 0), "members": members}, "dry_run": True}
+        async with self._atomic():
+            counts = await self.graph.erase_space(found.id)
+            await self.spaces.mark_erased(found.id)
+        await self._notify("space.erased", {"space_id": found.id})
+        return {"erased": {"space_id": found.id, "nodes": counts.get("nodes", 0),
+                           "edges": counts.get("edges", 0), "members": members}, "dry_run": False}
+
+    async def promote_to_space(self, node_id: str, space: str, keep_original: bool = True) -> dict[str, Any]:
+        """Copy a personal memory the caller owns into a space (writer or owner; D29).
+
+        The copy keeps content, category, refs, tags, created_at, source_agent
+        and source_session, records ``promoted_from``, and gets no edges.
+        ``keep_original=False`` deletes the personal original afterwards.
+        """
+        outer = await self._resolve_scope(None, None, None, None, "personal")
+        try:
+            original = await self.graph.get_node(node_id)
+            if original is None or original.space_id is not None:
+                return _not_found(node_id)
+            uid = _caller_uid()
+            owner = original.original_user_id
+            if (owner is not None and owner != uid) or not _caller_owns_node(original):
+                return _error("insufficient_role", "Only the node owner can promote this memory")
+            inner = await self._resolve_scope(space, None, None, SpaceRole.WRITER)
+            if inner.error is not None:
+                return inner.error
+            try:
+                sid = inner.space_ids[0]
+                result = await self._write_memory(_Validated(
+                    content=original.content_full or original.content_summary,
+                    source_session=original.source_session,
+                    visibility=Visibility.PRIVATE,
+                    org_id=None,
+                    category=original.category,
+                    refs=list(original.refs),
+                    tags=list(original.tags),
+                    space_id=sid,
+                    created_at=original.created_at,
+                    source_agent=original.source_agent,
+                    promoted_from=str(original.id),
+                ))
+                label = self._space_label(sid, inner.spaces)
+            finally:
+                inner.reset()
+            if "error" in result:
+                return result
+            if not keep_original:
+                await self.graph.delete_node(node_id)
+                await self._notify("memory.deleted", {"node_id": node_id})
+            return {"node_id": result["node_id"], "space": label}
+        finally:
+            outer.reset()

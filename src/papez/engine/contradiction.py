@@ -92,29 +92,48 @@ async def detect_contradictions(
     graph: GraphStorageProvider,
     embeddings: EmbeddingProvider,
     llm: LLMProvider,
+    llm_allowed: bool = True,
 ) -> list[tuple[str, float]]:
     """
     Check if new_node contradicts existing memories.
-    1. Vector search for similarity > 0.85
-    2. LLM confirmation
+    1. Vector search for similarity >= 0.85, within the node's own scope only
+       (its space, or personal memory; spec 6.9)
+    2. LLM confirmation (never when ``llm_allowed`` is False)
     3. Create CONTRADICTS edges for confirmed contradictions
     Returns list of (contradicted_node_id, confidence).
     """
-    if not new_node.embedding:
+    if not llm_allowed or not new_node.embedding:
         return []
 
-    # Find highly similar memories (potential contradictions)
-    candidates = await graph.vector_search(new_node.embedding, k=20)
+    from papez.engine.background import node_scope
+
+    space_id = new_node.space_id
+    # Search, compare and write only inside the node's own scope.
+    with node_scope(space_id):
+        return await _detect_in_scope(new_node, graph, llm, space_id)
+
+
+async def _detect_in_scope(
+    new_node: MemoryNode,
+    graph: GraphStorageProvider,
+    llm: LLMProvider,
+    space_id: str | None,
+) -> list[tuple[str, float]]:
+    candidates = await graph.vector_search(
+        new_node.embedding or [], k=20, space_ids=[space_id] if space_id else [],
+    )
     contradictions: list[tuple[str, float]] = []
 
     for candidate_node, sim_score in candidates:
         # Skip self
         if str(candidate_node.id) == str(new_node.id):
             continue
-        # Only check high-similarity pairs
-        # FalkorDB cosine distance: lower = more similar; convert to similarity
-        similarity = 1.0 - sim_score if sim_score <= 1.0 else sim_score
-        if similarity < 0.85:
+        # Never pair nodes from different spaces, or a space node with a personal one
+        if candidate_node.space_id != space_id:
+            continue
+        # Only check high-similarity pairs. Every storage backend returns
+        # cosine SIMILARITY (higher = more similar), not distance.
+        if sim_score < 0.85:
             continue
 
         content_a = new_node.content_full or new_node.content_summary

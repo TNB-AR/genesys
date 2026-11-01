@@ -28,8 +28,8 @@ class TestContradiction:
         existing = _make_node(content_full="I work at Google")
 
         graph = AsyncMock()
-        # Return existing node with high similarity (low distance)
-        graph.vector_search = AsyncMock(return_value=[(existing, 0.05)])  # 0.05 distance = 0.95 similarity
+        # Storage returns cosine SIMILARITY (higher = more similar)
+        graph.vector_search = AsyncMock(return_value=[(existing, 0.95)])
         graph.create_edge = AsyncMock()
         graph.update_node = AsyncMock()
 
@@ -52,7 +52,7 @@ class TestContradiction:
         existing = _make_node(content_full="I like JavaScript")
 
         graph = AsyncMock()
-        graph.vector_search = AsyncMock(return_value=[(existing, 0.1)])
+        graph.vector_search = AsyncMock(return_value=[(existing, 0.9)])
         graph.create_edge = AsyncMock()
 
         llm = AsyncMock()
@@ -72,7 +72,7 @@ class TestContradiction:
         )
 
         graph = AsyncMock()
-        graph.vector_search = AsyncMock(return_value=[(core_node, 0.05)])
+        graph.vector_search = AsyncMock(return_value=[(core_node, 0.95)])
         graph.create_edge = AsyncMock()
         graph.update_node = AsyncMock()
 
@@ -96,13 +96,42 @@ class TestContradiction:
         unrelated = _make_node(content_full="The weather is nice")
 
         graph = AsyncMock()
-        graph.vector_search = AsyncMock(return_value=[(unrelated, 0.5)])  # 0.5 distance = 0.5 similarity
+        graph.vector_search = AsyncMock(return_value=[(unrelated, 0.5)])  # 0.5 similarity, below the 0.85 floor
         graph.create_edge = AsyncMock()
 
         llm = AsyncMock()
 
         result = await detect_contradictions(new_node, graph, AsyncMock(), llm)
         assert len(result) == 0
+        llm.detect_contradiction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_near_duplicate_reaches_llm_and_distant_pair_does_not(self):
+        """Similarity semantics: 0.97 is checked, 0.10 (a 'distance' reading of 0.90) is not."""
+        new_node = _make_node(content_full="Rent is 2000")
+        near = _make_node(content_full="Rent is 2500")
+        far = _make_node(content_full="The cat is grey")
+
+        graph = AsyncMock()
+        graph.vector_search = AsyncMock(return_value=[(near, 0.97), (far, 0.10)])
+        graph.create_edge = AsyncMock()
+
+        llm = AsyncMock()
+        llm.detect_contradiction = AsyncMock(return_value=(False, 0.1, None))
+
+        await detect_contradictions(new_node, graph, AsyncMock(), llm)
+        assert llm.detect_contradiction.call_count == 1
+        assert llm.detect_contradiction.call_args[0][1] == "Rent is 2500"
+
+    @pytest.mark.asyncio
+    async def test_llm_not_allowed_skips_everything(self):
+        new_node = _make_node(content_full="I work at Meta")
+        graph = AsyncMock()
+        llm = AsyncMock()
+
+        result = await detect_contradictions(new_node, graph, AsyncMock(), llm, llm_allowed=False)
+        assert result == []
+        graph.vector_search.assert_not_called()
         llm.detect_contradiction.assert_not_called()
 
     @pytest.mark.asyncio

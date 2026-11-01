@@ -23,7 +23,20 @@ async def consolidation_score(
     """Composite score for core promotion.
 
     0.4 × activation + 0.3 × hub_score + 0.2 × schema_match + 0.1 × stability
+
+    Hub score and schema match use only the node's own scope (spec 6.9): the
+    storage reads below run with the scope narrowed to the node's space, or
+    to personal memory for a personal node. Degrees already count edges in
+    the node's own bucket (D04); the narrowing keeps ``get_stats`` (the
+    average degree) and ``get_edges`` inside the same graph.
     """
+    from papez.engine.background import node_scope
+
+    with node_scope(node.space_id):
+        return await _consolidation_score_in_scope(node, graph)
+
+
+async def _consolidation_score_in_scope(node: MemoryNode, graph: GraphStorageProvider) -> float:
     # ACT-R activation (normalized to 0-1 range)
     b_i = base_level_activation(node.reactivation_timestamps, node.created_at)
     activation_norm = min(max(math.exp(b_i), 0.0), 1.0)

@@ -189,9 +189,7 @@ def _ref_identity(ref: Ref) -> tuple[str, str, str | None, str | None]:
 def _matches_tags_and_ref_type(node: MemoryNode, tags_any: list[str] | None, ref_type: str | None) -> bool:
     if tags_any and not set(tags_any).intersection(node.tags):
         return False
-    if ref_type and not any(r.type == ref_type for r in node.refs):
-        return False
-    return True
+    return not ref_type or any(r.type == ref_type for r in node.refs)
 
 
 class _Scope:
@@ -769,9 +767,10 @@ class MCPToolHandler:
         except ValidationFailure as exc:
             return exc.as_error()
 
-        if req.external_id is not None:
-            if not isinstance(req.external_id, str) or not req.external_id or len(req.external_id) > _EXTERNAL_ID_MAX:
-                return _error("invalid_arguments", f"external_id must be 1-{_EXTERNAL_ID_MAX} characters")
+        if req.external_id is not None and (
+            not isinstance(req.external_id, str) or not req.external_id or len(req.external_id) > _EXTERNAL_ID_MAX
+        ):
+            return _error("invalid_arguments", f"external_id must be 1-{_EXTERNAL_ID_MAX} characters")
         if req.on_existing not in _ON_EXISTING:
             return _error("invalid_arguments", "on_existing must be one of 'skip', 'amend', 'error'")
 
@@ -1926,14 +1925,13 @@ class MCPToolHandler:
             return False
         ref_type = filters.get("ref_type")
         ref_id = filters.get("ref_id")
-        if ref_type or ref_id:
-            # Combined, both must match on the SAME ref (spec 5.4).
-            if not any(
-                (not ref_type or r.type == ref_type) and (not ref_id or r.id == ref_id)
-                for r in node.refs
-            ):
-                return False
-        return True
+        if not (ref_type or ref_id):
+            return True
+        # Combined, both must match on the SAME ref (spec 5.4).
+        return any(
+            (not ref_type or r.type == ref_type) and (not ref_id or r.id == ref_id)
+            for r in node.refs
+        )
 
     @staticmethod
     def _format_search_hit(
@@ -2721,7 +2719,7 @@ class MCPToolHandler:
                 llm_inference_enabled=llm_inference_enabled,
                 created_by=uid,
             )
-        except Exception as exc:  # pydantic ValidationError
+        except (ValueError, TypeError) as exc:  # pydantic ValidationError is a ValueError
             return _error("invalid_arguments", f"invalid space: {exc.__class__.__name__}")
         try:
             async with self._atomic():
@@ -2820,9 +2818,8 @@ class MCPToolHandler:
             return _error("invalid_arguments", "principal_type must be user|service and role owner|writer|reader")
         if ptype == PrincipalType.SERVICE and new_role == SpaceRole.OWNER:
             return _error("invalid_arguments", "A service principal can't be an owner")
-        if self.principal_in_org is not None:
-            if not await self.principal_in_org(found.org_id, principal_id):
-                return _error("principal_not_in_org", "That principal doesn't belong to the space's org")
+        if self.principal_in_org is not None and not await self.principal_in_org(found.org_id, principal_id):
+            return _error("principal_not_in_org", "That principal doesn't belong to the space's org")
         uid = _caller_uid() or ""
         existing = await self._get_member(found.id, principal_id)
         try:

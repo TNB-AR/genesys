@@ -91,7 +91,7 @@ async def _space_ids_to_maintain(graph: GraphStorageProvider) -> list[str]:
     if not hasattr(graph, "space_bucket_ids"):
         return []
     ids = await graph.space_bucket_ids()
-    return [i[len(SPACE_BUCKET_PREFIX):] if i.startswith(SPACE_BUCKET_PREFIX) else i for i in ids]
+    return [i.removeprefix(SPACE_BUCKET_PREFIX) for i in ids]
 
 
 async def run_maintenance(

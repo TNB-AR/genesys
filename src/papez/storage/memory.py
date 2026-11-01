@@ -948,9 +948,7 @@ class InMemoryGraphProvider:
         """
         if tags_any and not set(tags_any).intersection(node.tags):
             return False
-        if ref_type and not any(_ref_key(r)[0] == ref_type for r in node.refs):
-            return False
-        return True
+        return not ref_type or any(_ref_key(r)[0] == ref_type for r in node.refs)
 
     async def vector_search(
         self, embedding: list[float], k: int = 10, status_filter: list[MemoryStatus] | None = None, org_ids: list[str] | None = None,
@@ -1062,7 +1060,7 @@ class InMemoryGraphProvider:
         node_ids = set(self._user_nodes.get(bucket, {}))
         own_edges = len(self._user_edges.get(bucket, []))
         foreign_edges = 0
-        for other, _edge_list in self._user_edges.items():
+        for other in self._user_edges:
             if other == bucket:
                 continue
             seen: set[str] = set()

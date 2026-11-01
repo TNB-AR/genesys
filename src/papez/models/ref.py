@@ -28,7 +28,7 @@ class Ref(BaseModel):
     @field_validator("url")
     @classmethod
     def url_must_be_http(cls, v: str | None) -> str | None:
-        if v is not None and not (v.startswith("https://") or v.startswith("http://")):
+        if v is not None and not v.startswith(("https://", "http://")):
             raise ValueError("url must start with http:// or https://")
         return v
 

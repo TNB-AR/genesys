@@ -245,3 +245,33 @@ async def test_new_member_sees_space_on_next_call(space_world: SpaceWorld):
     assert (await carol.call("memory_recall", "pilot", space=w.a))["code"] == "space_not_found"
     await w.alice.call("space_member_add", w.a, "carol", "user", "reader")
     assert {r["id"] for r in (await carol.call("memory_recall", "Bank A pilot", space=w.a))["results"]} == w.a_ids
+
+
+# -- external_id / on_existing (spec 9.3; WS-L6 extends with the full matrix and batch) --
+
+
+async def test_on_existing_branches_in_space(space_world: SpaceWorld):
+    w = space_world
+    first = await w.svc.call("memory_store", "Doc 1 summary", space=w.a, external_id="doc-1",
+                             refs=[{"type": "document", "id": "1"}], tags=["t"])
+    assert first["status"] == "stored"
+    same = await w.svc.call("memory_store", "  Doc 1 summary ", space=w.a, external_id="doc-1",
+                            refs=[{"type": "document", "id": "1"}], tags=["T"])
+    assert same == {"node_id": first["node_id"], "status": "unchanged", "space": same["space"]}
+    skip = await w.svc.call("memory_store", "Doc 1 changed", space=w.a, external_id="doc-1", on_existing="skip")
+    assert (skip["node_id"], skip["status"]) == (first["node_id"], "exists")
+    err = await w.svc.call("memory_store", "Doc 1 changed", space=w.a, external_id="doc-1", on_existing="error")
+    assert err["code"] == "external_id_exists"
+    amended = await w.svc.call("memory_store", "Doc 1 changed", space=w.a, external_id="doc-1",
+                               refs=[{"type": "document", "id": "1"}], tags=["t"])
+    assert amended["status"] == "amended" and amended["superseded"] == first["node_id"]
+    # the index follows the amendment
+    again = await w.svc.call("memory_store", "Doc 1 changed", space=w.a, external_id="doc-1",
+                             refs=[{"type": "document", "id": "1"}], tags=["t"])
+    assert (again["node_id"], again["status"]) == (amended["node_id"], "unchanged")
+    # external ids are per space: the same id in B (bob) is a new memory
+    other = await w.bob.call("memory_store", "Doc 1 summary", space=w.b, external_id="doc-1")
+    assert other["status"] == "stored"
+    bad = await w.svc.call("memory_store", "x", space=w.a, external_id="", on_existing="amend")
+    assert bad["code"] == "invalid_arguments"
+    assert (await w.svc.call("memory_store", "x", space=w.a, on_existing="merge"))["code"] == "invalid_arguments"

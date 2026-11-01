@@ -32,7 +32,8 @@ src/papez/
 
 Key design principles:
 - **Storage abstraction is mandatory.** All data access goes through provider interfaces in `storage/base.py`. Never import a database client directly in business logic.
-- **Background processing for heavy operations.** Embedding generation, entity extraction, LLM-based inference, and consolidation are all async background tasks.
+- **Background processing for heavy operations.** Entity extraction, LLM-based inference, contradiction detection and consolidation run as background tasks. Embeddings are computed inline in `memory_store`.
+- **Every read goes through the visibility rule.** Space memories are visible only to members of the space; see [`docs/mind-spaces.md`](docs/mind-spaces.md). New tool parameters go at the end of the signature and are registered in `_TOOL_DISPATCH` and `_TOOL_DEFS`.
 - **The scoring formula is sacred.** `decay_score = relevance x connectivity x reactivation`. Multiplicative — zero on any axis means zero total.
 
 ## Getting started
@@ -50,7 +51,7 @@ python -m papez
 
 - **Python 3.11+**, async-first
 - **Linting**: `ruff check src/` (config in `pyproject.toml`, line length 120)
-- **Type checking**: `mypy src/papez --ignore-missing-imports` (strict mode configured)
+- **Type checking**: `mypy src/papez --ignore-missing-imports` (strict mode configured in `pyproject.toml`; this is what CI runs on Python 3.11). Locally, recent numpy stubs use syntax that mypy can't parse when targeting 3.11 (`numpy/__init__.pyi: Type statement is only supported in Python 3.12`), so run `python -m mypy src/papez --ignore-missing-imports --python-version 3.12` instead. It must report no issues.
 - **Formatting**: follow existing patterns — type hints throughout, minimal comments
 - Engine thresholds live in `engine/config.py` and are env-configurable. Don't hardcode magic numbers in engine files.
 

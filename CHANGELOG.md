@@ -1,6 +1,61 @@
 # Changelog
 
-## 0.6.2 (unreleased)
+## 0.7.0 (unreleased)
+
+Mind Spaces, references and tags, idempotent writes and an audit log. Additive: every new parameter is appended with a default, so existing calls and the `MCPToolHandler(...)` keyword construction keep working. The tool count goes from 13 to 26. Full reference: [`docs/mind-spaces.md`](docs/mind-spaces.md); integration guide: [`docs/integration.md`](docs/integration.md).
+
+### New tools
+
+- `space_create(name, slug=None, org_id=None, description=None, forgetting_policy="retain_all", llm_inference_enabled=True)`
+- `space_list(include_archived=False)`, `space_get(space)`
+- `space_update(space, name=None, description=None, forgetting_policy=None, llm_inference_enabled=None)`
+- `space_member_add(space, principal_id, principal_type, role)`, `space_member_remove(space, principal_id)`, `space_member_list(space)`
+- `space_archive(space)`, `space_unarchive(space)`, `space_erase(space, confirm_slug, dry_run=False)`
+- `promote_to_space(node_id, space, keep_original=True)`
+- `memory_store_batch(items, space=None, on_existing="amend")`
+- `memory_retire_by_ref(ref_type, ref_id, space=None, mode="amend")`
+
+### New parameters on existing tools
+
+- `memory_store`: `refs`, `tags`, `space`, `external_id`, `on_existing` (`amend` | `skip` | `error`). Results may carry `status` `exists` / `unchanged` / `amended`, `superseded` and `space`.
+- `memory_amend`: `refs`, `tags` (copied from the old memory when omitted, replaced when given).
+- `memory_recall`: `tags_any`, `ref_type`, `space`, `spaces`, `include_personal`.
+- `memory_search`: `space`, `spaces`, `include_personal`; new `filters` keys `tags_any`, `tags_all`, `ref_type`, `ref_id`.
+- `memory_traverse`: `space`, `spaces`, `include_personal`.
+- `list_core_memories`: `space`. `memory_stats`: `space`.
+- Output: full recall hits, search hits and `memory_explain` add `refs`, `tags`, `space`; concise recall hits add `tags`, `ref_count`, `space`; `list_core_memories` items add `tags` and `space`.
+
+### New library surface
+
+- Models: `Ref`, `normalize_tags`, `validate_refs`, `ValidationFailure` (`papez.models.ref`); `Space`, `SpaceMember` (`papez.models.space`); enums `SpaceRole`, `ForgettingPolicy`, `PrincipalType`. `MemoryNode` gains `refs`, `tags`, `space_id`, `external_id`, `promoted_from`, all defaulted; old state files load unchanged.
+- Context variables: `current_principal_type`, `current_space_roles`, `current_scope_space_ids`, `current_include_personal`, `current_client`.
+- `SpaceRegistry` protocol with `InMemorySpaceRegistry` (sidecar file `<persist>.spaces.json`) and `AuditSink` protocol with `InMemoryAuditSink`. `Providers` gains `spaces` and `audit`; `MCPToolHandler` gains trailing `spaces=None, audit=None`.
+- `GraphStorageProvider`: `space_ids` on every scoped read; `tags_any` / `ref_type` on `vector_search` and `keyword_search`; new `find_nodes_by_ref`, `find_node_by_external_id`, `space_bucket_ids`, `erase_space`, optional `atomic()`. `create_edge` raises `ValueError("cross_space_edge")`. `erase_user` adds `space_nodes_anonymized` and never deletes space memories.
+- Engine: `register_handlers(..., spaces=None)`, `run_maintenance(..., spaces=None)`, `maintenance_loop(..., spaces=None)`, `infer_and_link_causal_edges`, `detect_contradictions(..., llm_allowed=True)`, `check_and_consolidate(..., space_id=None)`.
+- `papez.server.STDIO_LOCAL_ORG = "stdio_local_org"`. The stdio server runs as `stdio_local_user` in that org, loads the space registry at start and reloads the caller's space roles before every call.
+- Config: `GENESYS_MAX_REFS_PER_MEMORY` (20), `GENESYS_MAX_TAGS_PER_MEMORY` (20), `GENESYS_MAX_TAG_LENGTH` (50), `GENESYS_BATCH_MAX_ITEMS` (100), `GENESYS_AUDIT_MAX_EVENTS` (100000), `GENESYS_AUDIT_READ_NODE_IDS_CAP` (50).
+- Error codes: every new error is `{"error", "code"}` with the codes listed in `docs/mind-spaces.md`. Existing tool errors keep their text and gain a `code` (`not_found`, `invalid_arguments`, `insufficient_role`).
+
+### Behaviour changes
+
+- `memory_traverse` from a node the caller can't see returns `{"error": "Node not found", "code": "not_found", "node_id"}`. It used to return an empty success.
+- `memory_stats` (and `get_stats`) count the caller's whole visible set, which for org members now includes visible org memories, not just the caller's own bucket. This matches what the hosted Postgres backend already did. `get_stats` returns both `nodes`/`edges` and `total_nodes`/`total_edges`.
+- `get_edges` / `get_all_edges` on an org memory include edges other org members created to it, as long as both ends are visible to the caller.
+- Deleting a memory (and `erase_space`, `destroy`) also removes edges in other buckets that pointed at it. They used to be left dangling.
+- Contradiction detection treats the storage score as cosine similarity, which is what every backend returns. It used to read it as a distance, so the 0.85 threshold selected the wrong pairs.
+- Maintenance runs a personal pass with an explicit personal-only scope, then one pass per space with that space's scope. Forgetting never prunes a `retain_all` space and counts orphan status inside the space for `standard` ones.
+- Background enrichment runs in the new memory's own scope only, and skips every LLM call (entity extraction, classification, causal inference, contradiction, consolidation) for spaces with `llm_inference_enabled=false`.
+- `memory_store` rejects empty or whitespace-only content with `invalid_arguments`.
+- `memory_amend` creates its `SUPERSEDES` edge directly at weight 1.0.
+- `memory_search` over-fetches candidates (up to `k*4`, at most 400) when a post-query filter is set, so filtered searches still return up to `k` results.
+- `retryable` is also `true` for `space_list`, `space_get`, `space_member_list`, and for `memory_store_batch` when every item carries an `external_id` (decided per call).
+
+### Docs
+
+- README: Mind Spaces, references and tags, idempotent writes and batches, rewritten retry guidance, embedding-provider disclosure, new config and tool rows. The `GENESYS_USER_ID` row now says the stdio server ignores it.
+- New `docs/mind-spaces.md` (behaviour reference) and `docs/integration.md` (end-to-end guide).
+
+## 0.6.2
 
 ### Forgetting now actually runs, and is safe to run
 

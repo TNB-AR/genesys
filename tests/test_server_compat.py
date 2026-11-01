@@ -9,6 +9,7 @@ The last test drives a real ``python -m papez`` subprocess over stdio.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import json
 import os
@@ -27,15 +28,23 @@ _SERVER_ACCEPTS_WEBSITE_URL = "website_url" in inspect.signature(Server.__init__
 _SDK_VALIDATES_INPUT = srv.SDK_TOOL_API == "request_handlers" or (
     hasattr(Server, "call_tool") and "validate_input" in inspect.signature(Server.call_tool).parameters
 )
+_CAN_EMBED_LOCALLY = importlib.util.find_spec("sentence_transformers") is not None
 requires_input_validation = pytest.mark.skipif(
     not _SDK_VALIDATES_INPUT, reason="this mcp release's call_tool decorator does not validate inputSchema"
 )
 
-EXPECTED_TOOLS = {
+CORE_TOOLS = {
     "memory_store", "memory_amend", "memory_recall", "memory_search", "memory_traverse",
     "memory_explain", "pin_memory", "unpin_memory", "list_core_memories", "delete_memory",
     "memory_stats", "set_core_preferences", "promote_to_org",
 }
+# Mind Spaces (spec 6.8). Count assertions use len(srv._TOOL_DEFS) (D31).
+SPACE_TOOLS = {
+    "space_create", "space_list", "space_get", "space_update", "space_member_add",
+    "space_member_remove", "space_member_list", "space_archive", "space_unarchive",
+    "space_erase", "promote_to_space",
+}
+EXPECTED_TOOLS = CORE_TOOLS | SPACE_TOOLS
 
 
 def _wire(model: Any) -> dict[str, Any]:
@@ -77,16 +86,65 @@ class TestRegistration:
             assert srv.app.website_url == srv.SERVER_WEBSITE_URL
             assert opts.website_url == srv.SERVER_WEBSITE_URL
 
-    async def test_tools_list_exposes_all_13_tools_with_their_schemas(self):
+    async def test_tools_list_exposes_every_tool_with_its_schema(self):
         result = await _list_tools_via_sdk()
         assert isinstance(result, t.ListToolsResult)
         by_name = {tool.name: tool for tool in result.tools}
-        assert set(by_name) == EXPECTED_TOOLS
-        assert len(result.tools) == 13
+        assert EXPECTED_TOOLS <= set(by_name)
+        assert set(by_name) == {d["name"] for d in srv._TOOL_DEFS}
+        assert len(result.tools) == len(srv._TOOL_DEFS)
         for declared in srv._TOOL_DEFS:
             served = _wire(by_name[declared["name"]])
             assert served["inputSchema"] == declared["inputSchema"]
             assert served["description"] == declared["description"]
+
+
+class TestDispatchMatchesDefs:
+    """Every schema property is dispatched and every dispatched arg is in the schema (D31)."""
+
+    def test_same_tool_names(self):
+        assert set(srv._TOOL_DISPATCH) == {d["name"] for d in srv._TOOL_DEFS}
+
+    @pytest.mark.parametrize("definition", srv._TOOL_DEFS, ids=lambda d: d["name"])
+    def test_properties_and_required_match_dispatch(self, definition):
+        method, required, optional = srv._TOOL_DISPATCH[definition["name"]]
+        schema = definition["inputSchema"]
+        props = set(schema.get("properties", {}))
+        assert props == set(required) | set(optional), definition["name"]
+        assert set(schema.get("required", [])) == set(required), definition["name"]
+        params = inspect.signature(method).parameters
+        for arg in (*required, *optional):
+            assert arg in params, f"{definition['name']}: handler has no parameter {arg!r}"
+
+    @pytest.mark.parametrize("definition", srv._TOOL_DEFS, ids=lambda d: d["name"])
+    def test_no_none_anywhere_in_schema(self, definition):
+        def walk(value: Any) -> None:
+            assert value is not None, definition["name"]
+            if isinstance(value, dict):
+                for v in value.values():
+                    walk(v)
+            elif isinstance(value, list):
+                for v in value:
+                    walk(v)
+
+        walk(definition["inputSchema"])
+
+    def test_include_personal_dispatch_default_is_none_without_json_default(self):
+        for name in ("memory_recall", "memory_search", "memory_traverse"):
+            _, _, optional = srv._TOOL_DISPATCH[name]
+            assert optional["include_personal"] is None
+            schema = next(d for d in srv._TOOL_DEFS if d["name"] == name)["inputSchema"]
+            assert "default" not in schema["properties"]["include_personal"]
+
+    def test_read_space_tools_are_retryable_and_writes_are_not(self):
+        assert {"space_list", "space_get", "space_member_list"} <= srv._RETRYABLE_TOOLS
+        for name in ("space_create", "space_update", "space_member_add", "space_member_remove",
+                     "space_archive", "space_unarchive", "space_erase", "promote_to_space"):
+            assert name not in srv._RETRYABLE_TOOLS
+
+    def test_stdio_constants(self):
+        assert srv.STDIO_LOCAL_USER == "stdio_local_user"
+        assert srv.STDIO_LOCAL_ORG == "stdio_local_org"
 
 
 class TestCallToolParity:
@@ -131,7 +189,12 @@ class TestStdioRoundTrip:
         from mcp import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
+        import papez
+
         env = {
+            # Run the SAME source tree as this test session (a worktree or a
+            # checkout other than the editable install's).
+            "PYTHONPATH": os.path.dirname(os.path.dirname(papez.__file__)),
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", str(tmp_path)),
             "GENESYS_PERSIST_PATH": str(tmp_path / "memories.json"),
@@ -149,7 +212,39 @@ class TestStdioRoundTrip:
                     assert info["websiteUrl"] == srv.SERVER_WEBSITE_URL
 
                 listed = await session.list_tools()
-                assert {tool.name for tool in listed.tools} == EXPECTED_TOOLS
+                assert {tool.name for tool in listed.tools} == {d["name"] for d in srv._TOOL_DEFS}
+                assert EXPECTED_TOOLS <= {tool.name for tool in listed.tools}
+
+                # Mind Spaces over stdio: the local user creates a space in the
+                # local org, writes into it, and the next call already sees it.
+                created = json.loads((await session.call_tool("space_create", {"name": "Round Trip"})).content[0].text)
+                assert created["space"]["slug"] == "round-trip"
+                assert created["space"]["org_id"] == srv.STDIO_LOCAL_ORG
+                assert created["space"]["your_role"] == "owner"
+                # With no OpenAI key the provider factory picks the local
+                # embedder, which needs sentence-transformers to embed at all
+                # (pre-existing; see providers._make_embedder). Store/recall
+                # only where an embedder can actually run.
+                if _CAN_EMBED_LOCALLY:
+                    stored = json.loads((await session.call_tool(
+                        "memory_store", {"content": "round trip space memory", "space": "round-trip", "tags": ["Trip"]},
+                    )).content[0].text)
+                    assert stored["status"] == "stored"
+                    assert stored["space"]["slug"] == "round-trip"
+                    listed_spaces = json.loads((await session.call_tool("space_list", {})).content[0].text)
+                    assert [s["memory_count"] for s in listed_spaces["spaces"]] == [1]
+                    recalled = json.loads((await session.call_tool(
+                        "memory_recall", {"query": "round trip", "space": "round-trip"},
+                    )).content[0].text)
+                    assert [r["id"] for r in recalled["results"]] == [stored["node_id"]]
+                    assert recalled["results"][0]["tags"] == ["trip"]
+                else:
+                    listed_spaces = json.loads((await session.call_tool("space_list", {})).content[0].text)
+                    assert [s["memory_count"] for s in listed_spaces["spaces"]] == [0]
+                missing = json.loads((await session.call_tool(
+                    "memory_recall", {"query": "x", "space": "nope"},
+                )).content[0].text)
+                assert missing == {"error": "Space not found", "code": "space_not_found"}
 
                 ok = await session.call_tool("memory_stats", {})
                 assert _wire(ok).get("isError", False) is False
@@ -165,3 +260,5 @@ class TestStdioRoundTrip:
                 assert json.loads(unknown.content[0].text) == {"error": "Unknown tool: not_a_tool", "retryable": False}
 
         await asyncio.wait_for(scenario(), timeout=60)
+        # The registry sidecar is written lazily, on the first mutation.
+        assert (tmp_path / "memories.spaces.json").exists()

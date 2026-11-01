@@ -38,12 +38,21 @@ def _make_handler() -> tuple[MCPToolHandler, AsyncMock, AsyncMock, AsyncMock]:
 class TestAllToolsRegistered:
     @pytest.mark.asyncio
     async def test_all_tools_registered(self):
-        """Server should list 13 tools (11 original + promote_to_org + memory_amend)."""
+        """Server lists every _TOOL_DEFS entry: the 13 core tools plus the Mind Spaces tools (D31)."""
         # Import and check tool listing
+        from papez import server as srv
         from papez.server import list_tools
         tool_list = await list_tools()
-        assert len(tool_list) == 13
+        assert len(tool_list) == len(srv._TOOL_DEFS)
         names = {t.name for t in tool_list}
+        space_tools = {
+            "space_create", "space_list", "space_get", "space_update", "space_member_add",
+            "space_member_remove", "space_member_list", "space_archive", "space_unarchive",
+            "space_erase", "promote_to_space",
+        }
+        assert space_tools <= names
+        names -= space_tools - {"memory_store_batch", "memory_retire_by_ref"}
+        names -= {"memory_store_batch", "memory_retire_by_ref"}  # WS-L6 tools, when present
         expected = {
             "memory_store", "memory_recall", "memory_search", "memory_traverse",
             "memory_explain", "pin_memory", "unpin_memory", "list_core_memories",

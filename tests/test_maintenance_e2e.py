@@ -89,3 +89,31 @@ async def test_loop_is_off_when_interval_is_zero():
 
     # Returns immediately instead of sleeping forever.
     await maintenance_loop(InMemoryGraphProvider(), None, None, interval_s=0)
+
+
+@pytest.mark.asyncio
+async def test_space_pass_runs_beside_the_personal_pass(_user_ctx):
+    """With a registry, each space gets its own pass; the personal result keeps its shape."""
+    from papez.models.enums import ForgettingPolicy
+    from papez.models.space import Space
+    from papez.storage.spaces import InMemorySpaceRegistry
+
+    graph = InMemoryGraphProvider()
+    await graph.initialize("maint-user")
+    reg = InMemorySpaceRegistry()
+    space = await reg.create_space(Space(
+        org_id="org-1", name="Team", slug="team", created_by="maint-user",
+        forgetting_policy=ForgettingPolicy.STANDARD,
+    ))
+    personal_idle = _node("personal, idle, unlinked", idle_days=60)
+    space_idle = _node("space, idle, unlinked", idle_days=60, space_id=space.id)
+    await graph.create_node(personal_idle)
+    await graph.create_node(space_idle)
+
+    result = await run_maintenance(graph, FakeEmbedder(), llm=None, spaces=reg)
+
+    assert result["pruned"] == [str(personal_idle.id)]
+    assert result["spaces"] == {space.id: {"rescored": 1, "transitions": 0, "pruned": [str(space_idle.id)]}}
+    assert await run_maintenance(graph, FakeEmbedder(), llm=None) == {
+        "rescored": 0, "transitions": 0, "pruned": [], "spaces": {},
+    }

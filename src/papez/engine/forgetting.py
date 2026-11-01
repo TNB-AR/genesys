@@ -4,9 +4,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from papez.engine import config
-from papez.models.enums import MemoryStatus, Visibility
+from papez.models.enums import ForgettingPolicy, MemoryStatus, Visibility
 from papez.models.node import MemoryNode
-from papez.storage.base import GraphStorageProvider
+from papez.storage.base import GraphStorageProvider, SpaceRegistry
 
 
 def _last_use(node: MemoryNode) -> datetime:
@@ -22,7 +22,10 @@ def is_idle(node: MemoryNode, now: datetime | None = None) -> bool:
     return now - _last_use(node) >= timedelta(days=config.FORGETTING_MIN_IDLE_DAYS)
 
 
-async def sweep_for_forgetting(graph: GraphStorageProvider) -> list[str]:
+async def sweep_for_forgetting(
+    graph: GraphStorageProvider,
+    spaces: SpaceRegistry | None = None,
+) -> list[str]:
     """
     Prune memories meeting ALL criteria:
     1. decay_score < FORGETTING_THRESHOLD
@@ -37,15 +40,27 @@ async def sweep_for_forgetting(graph: GraphStorageProvider) -> list[str]:
     without an idle period every unlinked memory would be pruned on the next
     maintenance pass, minutes after it was stored.
 
+    Space nodes (spec 6.9) are pruned only when ``spaces`` is given and the
+    node's space exists with ``forgetting_policy == standard``; a
+    ``retain_all`` space, an unknown/erased space, or no registry at all means
+    the node is kept (fail closed). Orphan status comes from ``get_orphans``,
+    which counts only edges in the node's own bucket, i.e. inside the space.
+
     Returns list of pruned node IDs.
     """
     pruned: list[str] = []
     now = datetime.now(UTC)
     orphans = await graph.get_orphans()
+    prunable_space: dict[str, bool] = {}
 
     for node in orphans:
         if node.visibility == Visibility.ORG:
             continue
+        if node.space_id is not None:
+            if node.space_id not in prunable_space:
+                prunable_space[node.space_id] = await _space_allows_pruning(node.space_id, spaces)
+            if not prunable_space[node.space_id]:
+                continue
         if (
             node.decay_score < config.FORGETTING_THRESHOLD
             and not node.pinned
@@ -57,3 +72,10 @@ async def sweep_for_forgetting(graph: GraphStorageProvider) -> list[str]:
             pruned.append(node_id)
 
     return pruned
+
+
+async def _space_allows_pruning(space_id: str, spaces: SpaceRegistry | None) -> bool:
+    if spaces is None:
+        return False
+    space = await spaces.get_space(space_id)
+    return space is not None and space.forgetting_policy == ForgettingPolicy.STANDARD

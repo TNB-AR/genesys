@@ -14,9 +14,11 @@ async def cascade_reactivate(
     graph: GraphStorageProvider,
     depth: int = config.CASCADE_DEPTH,
     decay_factor: float = config.CASCADE_DECAY_FACTOR,
+    space_ids: list[str] | None = None,
 ) -> list[str]:
     """
     Traverse up to `depth` hops, apply partial reactivation with decay_factor per hop.
+    ``space_ids`` is passed through to ``traverse`` (None = the context scope).
     Returns list of reactivated node IDs.
     """
     reactivated: list[str] = []
@@ -32,7 +34,7 @@ async def cascade_reactivate(
         next_level: list[str] = []
 
         for nid in current_level:
-            neighbors = await graph.traverse(nid, depth=1)
+            neighbors = await graph.traverse(nid, depth=1, space_ids=space_ids)
             for neighbor in neighbors:
                 nid_str = str(neighbor.id)
                 if nid_str in visited:

@@ -1029,6 +1029,254 @@ class MCPToolHandler:
             supersedes=(str(old.id), reason or "amended"),
         ))
 
+    # -- idempotent writes (spec 9.4, 9.5) ----------------------------------------
+
+    async def memory_store_batch(
+        self,
+        items: list[dict[str, Any]],
+        space: str | None = None,
+        on_existing: str = "amend",
+    ) -> dict[str, Any]:
+        """Store up to ``config.BATCH_MAX_ITEMS`` memories into one scope (spec 9.4).
+
+        Every item is validated first (content, refs, tags, category, edge
+        types, ``related`` targets in the same scope, ``ref_index`` pointing at
+        an earlier item, external_id conflicts under ``on_existing="error"``).
+        If any item is invalid nothing is stored and every problem is returned
+        as ``batch_invalid`` with ``items: [{index, code, error}]``. Otherwise
+        the items are written in order inside ``_atomic()``; a ``related``
+        entry ``{"ref_index": i, "type": t}`` links to the node item ``i``
+        resolved to. Returns ``{"results": [{index, node_id, status,
+        superseded?}]}``.
+
+        Retry safety: when every item carries an ``external_id`` the whole
+        batch is idempotent (a resend returns the same node ids with status
+        ``unchanged``), so a client may retry it after a timeout.
+        """
+        from papez.engine import config
+
+        if not isinstance(items, list):
+            return _error("invalid_arguments", "`items` must be a list of objects")
+        if len(items) > config.BATCH_MAX_ITEMS:
+            return _error(
+                "invalid_arguments",
+                f"a batch holds at most {config.BATCH_MAX_ITEMS} items (got {len(items)})",
+            )
+        if on_existing not in _ON_EXISTING:
+            return _error("invalid_arguments", "on_existing must be one of 'skip', 'amend', 'error'")
+
+        scope = await self._resolve_scope(space, None, None, SpaceRole.WRITER, "memberships")
+        if scope.error is not None:
+            return scope.error
+        try:
+            space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
+            problems: list[dict[str, Any]] = []
+            plans: list[tuple[_Validated, list[tuple[int, EdgeType]]]] = []
+            seen_external: set[str] = set()
+            for index, item in enumerate(items):
+                checked = await self._validate_batch_item(index, item, space_id, on_existing, seen_external)
+                if isinstance(checked, dict):
+                    problems.append({"index": index, "code": checked.get("code", "invalid_arguments"),
+                                     "error": checked.get("error", "invalid item")})
+                else:
+                    plans.append(checked)
+            if problems:
+                noun = "item is" if len(problems) == 1 else "items are"
+                return _error("batch_invalid", f"{len(problems)} {noun} invalid", items=problems)
+
+            results: list[dict[str, Any]] = []
+            async with self._atomic():
+                for index, (v, index_links) in enumerate(plans):
+                    for ref_index, etype in index_links:
+                        target = results[ref_index]["node_id"]
+                        if target not in {t for t, _ in v.related}:
+                            v.related.append((target, etype))
+                    if index_links:
+                        v.explicit_requested = True
+                    if v.external_id is not None:
+                        # Re-read at write time: an earlier item of this batch
+                        # may carry the same external_id (it then supersedes).
+                        v.existing = await self.graph.find_node_by_external_id(v.external_id, space_id)
+                    if v.existing is not None:
+                        written = await self._apply_on_existing(v)
+                    else:
+                        written = await self._write_memory(v)
+                    if "error" in written:
+                        # Validation ran first, so this is not expected; stop
+                        # rather than continue on a half-applied batch.
+                        return _error(
+                            written.get("code", "invalid_arguments"),
+                            f"item {index} failed after validation: {written.get('error')}",
+                            index=index,
+                            results=results,
+                        )
+                    row: dict[str, Any] = {
+                        "index": index, "node_id": written["node_id"], "status": written["status"],
+                    }
+                    if "superseded" in written:
+                        row["superseded"] = written["superseded"]
+                    results.append(row)
+            return {"results": results}
+        finally:
+            scope.reset()
+
+    _BATCH_ITEM_KEYS = frozenset({
+        "content", "refs", "tags", "category", "external_id", "related", "source_session", "created_at",
+    })
+
+    async def _validate_batch_item(
+        self,
+        index: int,
+        item: Any,
+        space_id: str | None,
+        on_existing: str,
+        seen_external: set[str],
+    ) -> tuple[_Validated, list[tuple[int, EdgeType]]] | dict[str, Any]:
+        """Validate one batch item; returns the plan or an error dict."""
+        if not isinstance(item, dict):
+            return _error("invalid_arguments", "each item must be an object")
+        unknown = sorted(set(item) - self._BATCH_ITEM_KEYS)
+        if unknown:
+            return _error("invalid_arguments", f"unknown item field(s): {', '.join(unknown)}")
+        related_raw = item.get("related")
+        if related_raw is not None and not isinstance(related_raw, list):
+            return _error("invalid_arguments", "`related` must be a list of objects")
+        by_id: list[dict[str, Any]] = []
+        index_links: list[tuple[int, EdgeType]] = []
+        for entry in related_raw or []:
+            if isinstance(entry, dict) and "ref_index" in entry:
+                if "id" in entry:
+                    return _error("invalid_arguments", "a `related` entry takes `id` or `ref_index`, not both")
+                ref_index = entry.get("ref_index")
+                if not isinstance(ref_index, int) or isinstance(ref_index, bool) or not 0 <= ref_index < index:
+                    return _error(
+                        "invalid_arguments", f"ref_index {ref_index!r} must point at an earlier item of this batch",
+                    )
+                raw_type = entry.get("type")
+                try:
+                    index_links.append((ref_index, EdgeType(raw_type)))
+                except (ValueError, KeyError):
+                    return _error("invalid_arguments", f"invalid edge type: {raw_type}")
+            else:
+                by_id.append(entry)
+        category = item.get("category")
+        if category is not None and not isinstance(category, str):
+            return _error("invalid_arguments", "category must be a string")
+        source_session = item.get("source_session", "")
+        if not isinstance(source_session, str):
+            return _error("invalid_arguments", "source_session must be a string")
+        created_at = item.get("created_at")
+        if created_at is not None:
+            if not isinstance(created_at, str):
+                return _error("invalid_arguments", "created_at must be an ISO 8601 string")
+            try:
+                _parse_iso_utc(created_at)
+            except ValueError:
+                return _error("invalid_arguments", f"invalid created_at: {created_at}")
+        content = item.get("content")
+        validated = await self._validate_store(_StoreRequest(
+            content=content if isinstance(content, str) else "",  # "" -> invalid_arguments
+            source_session=source_session,
+            created_at=created_at,
+            related=by_id or None,
+            category=category,
+            refs=item.get("refs"),
+            tags=item.get("tags"),
+            space_id=space_id,
+            external_id=item.get("external_id"),
+            on_existing=on_existing,
+        ))
+        if isinstance(validated, dict):
+            return validated
+        ext = validated.external_id
+        if ext is not None:
+            if on_existing == "error" and (validated.existing is not None or ext in seen_external):
+                return _error("external_id_exists", f"a current memory with external_id {ext!r} already exists")
+            seen_external.add(ext)
+        return validated, index_links
+
+    async def memory_retire_by_ref(
+        self,
+        ref_type: str,
+        ref_id: str,
+        space: str | None = None,
+        mode: str = "amend",
+    ) -> dict[str, Any]:
+        """Retire the memories that cite a removed source (spec 9.5).
+
+        Scope: the named space (writer or owner), or, for a user with no space,
+        the caller's own personal memories. A service must name a space.
+        Only current (non-superseded) memories are touched.
+
+        ``mode="amend"``: a memory whose only ref is this one is amended to
+        ``"[Retired] <summary> - source <label or id> was removed."`` and
+        tagged ``retired`` (the ref is kept for provenance; an already retired
+        memory is left alone, so a repeat call is a no-op). A memory with other
+        refs is amended with this ref removed. ``mode="delete"``: sole-ref
+        memories are deleted, the others amended with the ref removed.
+        Returns ``{"retired", "updated", "deleted"}``.
+        """
+        from papez.engine import config
+
+        if mode not in ("amend", "delete"):
+            return _error("invalid_arguments", "mode must be 'amend' or 'delete'")
+        if not isinstance(ref_type, str) or not ref_type or not isinstance(ref_id, str) or not ref_id:
+            return _error("invalid_arguments", "ref_type and ref_id must be non-empty strings")
+        scope = await self._resolve_scope(space, None, None, SpaceRole.WRITER, "personal")
+        if scope.error is not None:
+            return scope.error
+        try:
+            space_id = scope.space_ids[0] if space is not None and scope.space_ids else None
+            counts = {"retired": 0, "updated": 0, "deleted": 0}
+            nodes = await self.graph.find_nodes_by_ref(ref_type, ref_id)
+            async with self._atomic():
+                for node in nodes:
+                    if node.space_id != space_id:
+                        continue
+                    if space_id is None and not _caller_owns_node(node):
+                        continue  # org-visible memory of another user
+                    nid = str(node.id)
+                    incoming = await self.graph.get_edges(nid, "incoming", EdgeType.SUPERSEDES)
+                    if any(str(e.target_id) == nid for e in incoming):
+                        continue  # superseded: history, not a current memory
+                    denied = await self._authorize_write(node, "Only the node owner can retire this memory")
+                    if denied is not None:
+                        continue
+                    matching = [r for r in node.refs if r.type == ref_type and r.id == ref_id]
+                    if not matching:
+                        continue
+                    remaining = [r for r in node.refs if not (r.type == ref_type and r.id == ref_id)]
+                    if remaining:
+                        result = await self._amend_node(
+                            node, node.content_full or node.content_summary,
+                            f"ref {ref_type}:{ref_id} removed", [_ref_dump(r) for r in remaining], None,
+                        )
+                        if "error" in result:
+                            return result
+                        await self._notify("memory.amended", {"node_id": result["node_id"], "supersedes": nid})
+                        counts["updated"] += 1
+                    elif mode == "delete":
+                        await self.graph.delete_node(nid)
+                        await self._notify("memory.deleted", {"node_id": nid})
+                        counts["deleted"] += 1
+                    else:
+                        if "retired" in node.tags:
+                            continue
+                        source = matching[0].label or matching[0].id
+                        content = f"[Retired] {node.content_summary} - source {source} was removed."
+                        # Keep within the tag limit: ``retired`` always survives.
+                        keep = [t for t in node.tags if t != "retired"][: max(config.MAX_TAGS_PER_MEMORY - 1, 0)]
+                        result = await self._amend_node(
+                            node, content, f"source {ref_type}:{ref_id} removed", None, [*keep, "retired"],
+                        )
+                        if "error" in result:
+                            return result
+                        await self._notify("memory.amended", {"node_id": result["node_id"], "supersedes": nid})
+                        counts["retired"] += 1
+            return counts
+        finally:
+            scope.reset()
+
     async def memory_recall(
         self,
         query: str,

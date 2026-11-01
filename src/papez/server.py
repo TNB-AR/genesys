@@ -108,6 +108,9 @@ _TOOL_DISPATCH: dict[str, tuple[Any, ...]] = {
     "space_unarchive": (tools.space_unarchive, ["space"], {}),
     "space_erase": (tools.space_erase, ["space", "confirm_slug"], {"dry_run": False}),
     "promote_to_space": (tools.promote_to_space, ["node_id", "space"], {"keep_original": True}),
+    # Idempotent writes (spec 9.4, 9.5)
+    "memory_store_batch": (tools.memory_store_batch, ["items"], {"space": None, "on_existing": "amend"}),
+    "memory_retire_by_ref": (tools.memory_retire_by_ref, ["ref_type", "ref_id"], {"space": None, "mode": "amend"}),
 }
 
 # Shared JSON Schema fragments for the Mind Spaces parameters. Never put a
@@ -317,6 +320,43 @@ _TOOL_DEFS: list[dict[str, Any]] = [
             "keep_original": {"type": "boolean", "default": True, "description": "If false, delete the personal original after copying."},
         },
     }},
+    # -- Idempotent writes (spec 9.4, 9.5) -------------------------------------
+    {"name": "memory_store_batch", "description": "Store up to GENESYS_BATCH_MAX_ITEMS (default 100) memories in one call, all into one space (or your personal memory when `space` is omitted; services must name a space). Every item is validated first; if any item is invalid nothing is stored and the error `batch_invalid` lists each problem with its index. Items are then stored in order; an item's `related` entry may be {\"ref_index\": i, \"type\": t} to link to earlier item i. Returns one result per item: {index, node_id, status: stored|exists|unchanged|amended, superseded?}. Retry safety: when every item carries an `external_id` the batch is idempotent, so it is safe to resend the whole batch after a timeout (unchanged items come back with the same node ids). Without external_id a resend creates duplicates.", "inputSchema": {
+        "type": "object", "required": ["items"],
+        "properties": {
+            "items": {"type": "array", "description": "The memories to store, in order.", "items": {
+                "type": "object", "required": ["content"],
+                "properties": {
+                    "content": {"type": "string"},
+                    "refs": _REFS_SCHEMA,
+                    "tags": _TAGS_SCHEMA,
+                    "category": {"type": "string"},
+                    "external_id": {"type": "string", "maxLength": 256, "description": "Your own id for this memory; makes the item idempotent."},
+                    "source_session": {"type": "string"},
+                    "created_at": {"type": "string", "description": "Optional ISO 8601 timestamp."},
+                    "related": {"type": "array", "description": "Typed edges from this item: {id, type} for an existing node in the same space, or {ref_index, type} for an earlier item of this batch.", "items": {
+                        "type": "object", "required": ["type"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "ref_index": {"type": "integer", "minimum": 0},
+                            "type": {"type": "string", "enum": ["caused_by", "supports", "contradicts", "supersedes", "derived_from", "related_to", "temporal_sequence"]},
+                        },
+                    }},
+                },
+            }},
+            "space": _SPACE_WRITE_SCHEMA,
+            "on_existing": {"type": "string", "enum": ["skip", "amend", "error"], "default": "amend", "description": "Applies to every item whose external_id already exists: skip, amend (unless identical), or error (the whole batch is refused)."},
+        },
+    }},
+    {"name": "memory_retire_by_ref", "description": "Retire the memories that cite a source that was removed. mode=amend (default): a memory whose only ref is this one is amended to a '[Retired] ...' note tagged `retired` (history is kept); a memory with other refs is amended with this ref removed. mode=delete: sole-ref memories are deleted and the ref is removed from the others. Needs writer or owner when `space` is named; without `space` it acts on your personal memory (services must name a space). Returns {retired, updated, deleted}.", "inputSchema": {
+        "type": "object", "required": ["ref_type", "ref_id"],
+        "properties": {
+            "ref_type": {"type": "string", "description": "The removed source's ref type, e.g. 'document'."},
+            "ref_id": {"type": "string", "description": "The removed source's id."},
+            "space": _SPACE_WRITE_SCHEMA,
+            "mode": {"type": "string", "enum": ["amend", "delete"], "default": "amend"},
+        },
+    }},
 ]
 
 _TOOL_SCHEMAS: list[Tool] = [Tool.model_validate(definition) for definition in _TOOL_DEFS]
@@ -338,6 +378,24 @@ _RETRYABLE_TOOLS = {
 }
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_retryable(name: str, arguments: dict[str, Any]) -> bool:
+    """Whether a failed call is safe to resend as-is.
+
+    Read tools always are. ``memory_store_batch`` is too when every item
+    carries an ``external_id`` (spec 9.4): a resend then re-matches each item
+    instead of duplicating it.
+    """
+    if name in _RETRYABLE_TOOLS:
+        return True
+    if name == "memory_store_batch":
+        items = arguments.get("items")
+        return (
+            isinstance(items, list) and bool(items)
+            and all(isinstance(i, dict) and isinstance(i.get("external_id"), str) and i["external_id"] for i in items)
+        )
+    return False
 
 
 def _error_content(message: str, retryable: bool) -> list[TextContent]:
@@ -377,7 +435,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     except Exception as exc:
         _logger.exception("Tool %s failed", name)
         return _error_content(
-            f"{type(exc).__name__}: {exc}", retryable=name in _RETRYABLE_TOOLS
+            f"{type(exc).__name__}: {exc}", retryable=_is_retryable(name, arguments)
         )
     finally:
         if roles_token is not None:

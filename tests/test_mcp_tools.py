@@ -51,7 +51,7 @@ class TestAllToolsRegistered:
             "space_erase", "promote_to_space",
         }
         assert space_tools <= names
-        names -= space_tools - {"memory_store_batch", "memory_retire_by_ref"}
+        names -= space_tools
         names -= {"memory_store_batch", "memory_retire_by_ref"}  # WS-L6 tools, when present
         expected = {
             "memory_store", "memory_recall", "memory_search", "memory_traverse",
